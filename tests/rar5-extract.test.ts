@@ -39,11 +39,11 @@ for (const name of fixtures) {
 			for await (const entry of unrar(reader)) {
 				entries++;
 
-				// directories, links, encrypted data, and compressed data are not
-				// covered by stored extraction.
+				// directories, links, encrypted data, and solid entries are not
+				// yet covered; everything else, stored or compressed, is verified.
 				if (
 					entry.isDirectory || entry.linkTarget !== undefined ||
-					entry.isEncrypted || entry.compressionMethod !== 0
+					entry.isEncrypted || entry.isSolid
 				) {
 					continue;
 				}

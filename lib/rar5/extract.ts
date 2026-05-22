@@ -3,8 +3,9 @@ import { decodeUtf8From, read } from '../utils/buffer.ts';
 import type { Reader } from '../reader/types.ts';
 import type { FileBlock } from './block.ts';
 import { isDirectory, isSymlink, parseBlock } from './block.ts';
-import { BlockFlag, RAR5_SIGNATURE } from './constants.ts';
+import { BlockFlag, COMPRESSION_SOLID, RAR5_SIGNATURE } from './constants.ts';
 import { Cursor } from './cursor.ts';
+import { decompress } from './unpack.ts';
 
 /**
  * @module
@@ -165,6 +166,15 @@ export class RarEntry {
 	}
 
 	/**
+	 * whether the entry is part of a solid block, and so depends on the
+	 * decompression state of the entries before it.
+	 * @returns true for a solid entry
+	 */
+	get isSolid(): boolean {
+		return (this.#block.compressionInfo & COMPRESSION_SOLID) !== 0;
+	}
+
+	/**
 	 * the data CRC32, when the archive records one.
 	 * @returns the checksum, or undefined when absent
 	 */
@@ -202,15 +212,30 @@ export class RarEntry {
 				throw new Error(`cannot read ${block.name}: encrypted entries are not yet supported`);
 			}
 
-			const method = (block.compressionInfo >> 7) & 0x07;
-			if (method !== 0) {
+			// a stored entry's data area is its content verbatim.
+			if (((block.compressionInfo >> 7) & 0x07) === 0) {
+				return await reader.read(block.dataOffset, block.dataSize);
+			}
+
+			if (block.compressionInfo & COMPRESSION_SOLID) {
 				throw new Error(
-					`cannot read ${block.name}: compression method ${method} is not yet supported`,
+					`cannot read ${block.name}: solid compressed entries are not yet supported`,
 				);
 			}
 
-			// a stored entry's data area is its content verbatim.
-			return await reader.read(block.dataOffset, block.dataSize);
+			const compressed = await readBytes(reader, block.dataOffset, block.dataSize);
+			const output = decompress(
+				compressed,
+				block.unpackedSize,
+				(block.compressionInfo >> 10) & 15,
+			);
+
+			return new ReadableStream({
+				start(controller) {
+					controller.enqueue(output);
+					controller.close();
+				},
+			});
 		});
 	}
 

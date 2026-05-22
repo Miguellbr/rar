@@ -1,0 +1,631 @@
+/**
+ * @module
+ *
+ * the RAR5 decompression algorithm ("unpack version 5"): an LZ77 scheme with
+ * canonical Huffman coding, organized into self-describing blocks.
+ *
+ * this is an independent implementation written from an understanding of the
+ * format; it does not incorporate code from RARLAB's unrar.
+ */
+
+// #region constants
+
+// huffman table sizes: bit-length codes, literals, distances, low distance
+// bits, and repeated distances.
+const SIZE_BC = 20;
+const SIZE_NC = 306;
+const SIZE_DC = 64;
+const SIZE_LDC = 16;
+const SIZE_RC = 44;
+const SIZE_TABLE = SIZE_NC + SIZE_DC + SIZE_LDC + SIZE_RC;
+
+// base size of the sliding window before the dictionary-size multiplier.
+const BASE_WINDOW = 0x20000;
+
+// #endregion
+
+// #region bit reader
+
+// a most-significant-bit-first reader over a block's bytes. the backing buffer
+// must carry at least 8 bytes of zero padding past the block so that the
+// 16- and 32-bit peeks never read out of bounds.
+class BitReader {
+	readonly #data: Uint8Array;
+	/** byte offset of the next unread bit */
+	addr: number = 0;
+	/** bit offset within that byte, 0 through 7 */
+	bit: number = 0;
+
+	constructor(data: Uint8Array) {
+		this.#data = data;
+	}
+
+	/** the next 16 bits, without consuming them. */
+	peek16(): number {
+		const p = this.#data;
+		const a = this.addr;
+		const bits = (p[a] << 16) | (p[a + 1] << 8) | p[a + 2];
+
+		return (bits >>> (8 - this.bit)) & 0xffff;
+	}
+
+	/** the next 32 bits, without consuming them. */
+	peek32(): number {
+		const p = this.#data;
+		const a = this.addr;
+		const bits = ((p[a] << 24) | (p[a + 1] << 16) | (p[a + 2] << 8) | p[a + 3]) >>> 0;
+
+		if (this.bit === 0) {
+			return bits;
+		}
+
+		return ((bits << this.bit) | (p[a + 4] >>> (8 - this.bit))) >>> 0;
+	}
+
+	/**
+	 * advances past `count` bits.
+	 * @param count number of bits to skip
+	 */
+	skip(count: number): void {
+		const total = this.bit + count;
+		this.addr += total >> 3;
+		this.bit = total & 7;
+	}
+
+	/**
+	 * reads and consumes between 1 and 16 bits.
+	 * @param count number of bits to read
+	 * @returns the bits, right-aligned
+	 */
+	read(count: number): number {
+		const value = this.peek16() >>> (16 - count);
+		this.skip(count);
+
+		return value;
+	}
+}
+
+// #endregion
+
+// #region huffman
+
+interface DecodeTable {
+	size: number;
+	decodeLength: Int32Array;
+	decodePosition: Uint32Array;
+	quickBits: number;
+	quickLength: Uint8Array;
+	quickNumber: Uint16Array;
+	decodeNumber: Uint16Array;
+}
+
+// builds a canonical Huffman decode table from per-symbol code lengths.
+const createDecodeTable = (lengths: Uint8Array, size: number): DecodeTable => {
+	const counts = new Array<number>(16).fill(0);
+	for (let idx = 0; idx < size; idx++) {
+		counts[lengths[idx] & 15]++;
+	}
+	counts[0] = 0;
+
+	const decodeLength = new Int32Array(16);
+	const decodePosition = new Uint32Array(16);
+
+	let upperLimit = 0;
+	for (let len = 1; len < 16; len++) {
+		upperLimit += counts[len];
+		decodeLength[len] = upperLimit << (16 - len);
+		decodePosition[len] = decodePosition[len - 1] + counts[len - 1];
+		upperLimit <<= 1;
+	}
+
+	if (upperLimit > 65536) {
+		throw new Error(`over-subscribed huffman table`);
+	}
+
+	const decodeNumber = new Uint16Array(size);
+	{
+		const cursor = decodePosition.slice();
+		for (let idx = 0; idx < size; idx++) {
+			const len = lengths[idx] & 15;
+			if (len > 0) {
+				decodeNumber[cursor[len]++] = idx;
+			}
+		}
+	}
+
+	const quickBits = size === SIZE_NC ? 10 : 7;
+	const quickCount = 1 << quickBits;
+	const quickLength = new Uint8Array(quickCount);
+	const quickNumber = new Uint16Array(quickCount);
+
+	let len = 1;
+	for (let code = 0; code < quickCount; code++) {
+		const field = code << (16 - quickBits);
+
+		while (len < 16 && field >= decodeLength[len]) {
+			len++;
+		}
+		quickLength[code] = len;
+
+		const position = decodePosition[len & 15] + ((field - decodeLength[len - 1]) >> (16 - len));
+		quickNumber[code] = len < 16 && position < size ? decodeNumber[position] : 0;
+	}
+
+	return { decodeLength, decodeNumber, decodePosition, quickBits, quickLength, quickNumber, size };
+};
+
+// decodes one symbol from the bit stream using a decode table.
+const decodeNumber = (table: DecodeTable, bits: BitReader): number => {
+	const field = bits.peek16() & 0xfffe;
+
+	if (field < table.decodeLength[table.quickBits]) {
+		const code = field >>> (16 - table.quickBits);
+		bits.skip(table.quickLength[code]);
+
+		return table.quickNumber[code];
+	}
+
+	let length = 15;
+	for (let candidate = table.quickBits + 1; candidate < 15; candidate++) {
+		if (field < table.decodeLength[candidate]) {
+			length = candidate;
+			break;
+		}
+	}
+
+	bits.skip(length);
+
+	const position = table.decodePosition[length] +
+		((field - table.decodeLength[length - 1]) >>> (16 - length));
+
+	return table.decodeNumber[position >= table.size ? 0 : position];
+};
+
+// #endregion
+
+// #region block parsing
+
+interface BlockHeader {
+	tablePresent: boolean;
+	lastBlock: boolean;
+	/** number of meaningful bits in the block's final byte */
+	bitSize: number;
+	blockSize: number;
+	headerSize: number;
+}
+
+const parseBlockHeader = (data: Uint8Array, offset: number): BlockHeader => {
+	const flags = data[offset];
+	const checksum = data[offset + 1];
+
+	const byteCount = (flags >> 3) & 7;
+	if (byteCount > 2) {
+		throw new Error(`unsupported block header size`);
+	}
+
+	let blockSize = 0;
+	for (let idx = 0; idx <= byteCount; idx++) {
+		blockSize |= data[offset + 2 + idx] << (8 * idx);
+	}
+
+	const expected = 0x5a ^ flags ^ (blockSize & 0xff) ^ ((blockSize >> 8) & 0xff) ^
+		((blockSize >> 16) & 0xff);
+	if (expected !== checksum) {
+		throw new Error(`block header checksum mismatch`);
+	}
+
+	return {
+		bitSize: flags & 7,
+		blockSize,
+		headerSize: 2 + byteCount + 1,
+		lastBlock: ((flags >> 6) & 1) === 1,
+		tablePresent: ((flags >> 7) & 1) === 1,
+	};
+};
+
+interface Tables {
+	literal: DecodeTable;
+	distance: DecodeTable;
+	lowDistance: DecodeTable;
+	repeatDistance: DecodeTable;
+}
+
+// reads the Huffman tables stored at the start of a block. the table data
+// begins with nibble-packed, run-length-encoded bit lengths; the bit reader is
+// left positioned just past it.
+const parseTables = (data: Uint8Array, bits: BitReader): Tables => {
+	// stage 1: 20 nibble-packed bit lengths, with 15 escaping a zero run.
+	const bcLengths = new Uint8Array(SIZE_BC);
+	let pos = 0;
+	let high = true;
+
+	const nibble = (): number => {
+		const value = high ? data[pos] >> 4 : data[pos++] & 0x0f;
+		high = !high;
+		return value;
+	};
+
+	for (let written = 0; written < SIZE_BC;) {
+		const value = nibble();
+
+		if (value !== 15) {
+			bcLengths[written++] = value;
+			continue;
+		}
+
+		const run = nibble();
+		if (run === 0) {
+			bcLengths[written++] = 15;
+		} else {
+			for (let idx = 0; idx < run + 2 && written < SIZE_BC; idx++) {
+				bcLengths[written++] = 0;
+			}
+		}
+	}
+
+	bits.addr = pos;
+	bits.bit = high ? 0 : 4;
+
+	const bcTable = createDecodeTable(bcLengths, SIZE_BC);
+
+	// stage 2: the remaining code lengths, Huffman-coded with the bit-length
+	// table and a run-length scheme of their own.
+	const lengths = new Uint8Array(SIZE_TABLE);
+	for (let idx = 0; idx < SIZE_TABLE;) {
+		const symbol = decodeNumber(bcTable, bits);
+
+		if (symbol < 16) {
+			lengths[idx++] = symbol;
+			continue;
+		}
+
+		let run: number;
+		if (symbol === 16 || symbol === 18) {
+			run = (bits.peek16() >>> 13) + 3;
+			bits.skip(3);
+		} else {
+			run = (bits.peek16() >>> 9) + 11;
+			bits.skip(7);
+		}
+
+		if (symbol < 18) {
+			// repeat the previous length
+			if (idx === 0) {
+				throw new Error(`huffman table repeat with no previous length`);
+			}
+			for (; run > 0 && idx < SIZE_TABLE; run--, idx++) {
+				lengths[idx] = lengths[idx - 1];
+			}
+		} else {
+			// a run of zero lengths
+			for (; run > 0 && idx < SIZE_TABLE; run--, idx++) {
+				lengths[idx] = 0;
+			}
+		}
+	}
+
+	return {
+		distance: createDecodeTable(lengths.subarray(SIZE_NC, SIZE_NC + SIZE_DC), SIZE_DC),
+		literal: createDecodeTable(lengths.subarray(0, SIZE_NC), SIZE_NC),
+		lowDistance: createDecodeTable(
+			lengths.subarray(SIZE_NC + SIZE_DC, SIZE_NC + SIZE_DC + SIZE_LDC),
+			SIZE_LDC,
+		),
+		repeatDistance: createDecodeTable(lengths.subarray(SIZE_NC + SIZE_DC + SIZE_LDC), SIZE_RC),
+	};
+};
+
+// #endregion
+
+// #region filters
+
+// filter type codes carried in the stream. RAR5 only emits the first four.
+const FILTER_DELTA = 0;
+const FILTER_E8 = 1;
+const FILTER_E8E9 = 2;
+const FILTER_ARM = 3;
+
+interface Filter {
+	type: number;
+	/** absolute window offset the filter transforms */
+	blockStart: number;
+	blockLength: number;
+	/** interleaved channel count, for the delta filter */
+	channels: number;
+}
+
+// reads a little-endian value prefixed by a 2-bit byte count.
+const parseFilterValue = (bits: BitReader): number => {
+	const byteCount = bits.read(2) + 1;
+
+	let value = 0;
+	for (let idx = 0; idx < byteCount; idx++) {
+		value += (bits.peek16() >>> 8) * 2 ** (idx * 8);
+		bits.skip(8);
+	}
+
+	return value;
+};
+
+// reads a filter command from the stream, as introduced by literal code 256.
+const parseFilter = (bits: BitReader, writePtr: number): Filter => {
+	const blockStart = parseFilterValue(bits);
+	const blockLength = parseFilterValue(bits);
+
+	const type = bits.peek16() >>> 13;
+	bits.skip(3);
+
+	const channels = type === FILTER_DELTA ? bits.read(5) + 1 : 1;
+
+	return { blockLength, blockStart: writePtr + blockStart, channels, type };
+};
+
+const readLe32 = (data: Uint8Array, offset: number): number => {
+	return (data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16) |
+		(data[offset + 3] << 24)) >>> 0;
+};
+
+const writeLe32 = (data: Uint8Array, offset: number, value: number): void => {
+	data[offset] = value;
+	data[offset + 1] = value >>> 8;
+	data[offset + 2] = value >>> 16;
+	data[offset + 3] = value >>> 24;
+};
+
+// transforms a filtered window region, returning the corrected bytes.
+const runFilter = (filter: Filter, window: Uint8Array): Uint8Array => {
+	const { blockLength, blockStart, channels, type } = filter;
+	const out = new Uint8Array(blockLength);
+
+	switch (type) {
+		case FILTER_DELTA: {
+			// each channel is delta-decoded independently, then interleaved.
+			let source = 0;
+			for (let channel = 0; channel < channels; channel++) {
+				let previous = 0;
+				for (let dest = channel; dest < blockLength; dest += channels) {
+					previous = (previous - window[blockStart + source]) & 0xff;
+					out[dest] = previous;
+					source++;
+				}
+			}
+			return out;
+		}
+		case FILTER_E8:
+		case FILTER_E8E9: {
+			// rewrites x86 call/jump targets from relative to absolute form.
+			out.set(window.subarray(blockStart, blockStart + blockLength));
+			const extended = type === FILTER_E8E9;
+			const fileSize = 0x1000000;
+
+			for (let idx = 0; idx < blockLength - 4;) {
+				const opcode = window[blockStart + idx++];
+				if (opcode === 0xe8 || (extended && opcode === 0xe9)) {
+					const at = (idx + blockStart) % fileSize;
+					const addr = readLe32(window, blockStart + idx);
+
+					if (addr & 0x80000000) {
+						if (((addr + at) & 0x80000000) === 0) {
+							writeLe32(out, idx, (addr + fileSize) >>> 0);
+						}
+					} else if ((addr - fileSize) & 0x80000000) {
+						writeLe32(out, idx, (addr - at) >>> 0);
+					}
+
+					idx += 4;
+				}
+			}
+			return out;
+		}
+		case FILTER_ARM: {
+			// rewrites ARM branch-and-link instruction offsets.
+			out.set(window.subarray(blockStart, blockStart + blockLength));
+
+			for (let idx = 0; idx < blockLength - 3; idx += 4) {
+				if (window[blockStart + idx + 3] === 0xeb) {
+					let offset = readLe32(window, blockStart + idx) & 0x00ffffff;
+					offset = (offset - ((idx + blockStart) >> 2)) & 0x00ffffff;
+					writeLe32(out, idx, (offset | 0xeb000000) >>> 0);
+				}
+			}
+			return out;
+		}
+		default: {
+			throw new Error(`unsupported filter type ${type}`);
+		}
+	}
+};
+
+// #endregion
+
+// #region unpack
+
+// derives a match length from a length code, reading extra bits as needed.
+const decodeLength = (code: number, bits: BitReader): number => {
+	if (code < 8) {
+		return 2 + code;
+	}
+
+	const extra = (code >> 2) - 1;
+	const length = 2 + ((4 | (code & 3)) << extra);
+
+	return length + bits.read(extra);
+};
+
+/**
+ * decompresses the data area of a RAR5 file entry.
+ *
+ * this handles non-solid entries whose uncompressed size does not exceed the
+ * dictionary size, which the entry's data area is decoded into directly.
+ *
+ * @param compressed the entry's compressed data area
+ * @param unpackedSize the expected uncompressed size
+ * @param dictionarySizeExponent the dictionary-size exponent from the entry's
+ * compression information field
+ * @returns the uncompressed bytes
+ * @throws if the stream uses a feature that is not yet supported, or is invalid
+ */
+export const decompress = (
+	compressed: Uint8Array,
+	unpackedSize: number,
+	dictionarySizeExponent: number,
+): Uint8Array<ArrayBuffer> => {
+	const windowSize = BASE_WINDOW * 2 ** dictionarySizeExponent;
+	if (unpackedSize > windowSize) {
+		throw new Error(`entries larger than the dictionary are not yet supported`);
+	}
+
+	// the window holds raw decoded bytes; filters transform regions of it on
+	// the way to the final output.
+	const window = new Uint8Array(unpackedSize);
+	const filters: Filter[] = [];
+
+	// the dist cache holds the four most-recently-used match distances.
+	const distCache = [0, 0, 0, 0];
+	let lastLength = 0;
+	let write = 0;
+
+	// copies a previously written run, handling overlap byte by byte.
+	const copy = (length: number, distance: number): void => {
+		for (let idx = 0; idx < length; idx++) {
+			window[write + idx] = window[write + idx - distance];
+		}
+		write += length;
+	};
+
+	let tables: Tables | undefined;
+	let offset = 0;
+
+	while (write < unpackedSize) {
+		const header = parseBlockHeader(compressed, offset);
+		offset += header.headerSize;
+
+		const block = new Uint8Array(header.blockSize + 8);
+		block.set(compressed.subarray(offset, offset + header.blockSize));
+		offset += header.blockSize;
+
+		const bits = new BitReader(block);
+		if (header.tablePresent) {
+			tables = parseTables(block, bits);
+		}
+		if (tables === undefined) {
+			throw new Error(`block references huffman tables that were never defined`);
+		}
+
+		const blockBitSize = 1 + header.bitSize;
+		const lastByte = header.blockSize - 1;
+
+		while (write < unpackedSize) {
+			if (bits.addr > lastByte || (bits.addr === lastByte && bits.bit >= blockBitSize)) {
+				break;
+			}
+
+			const symbol = decodeNumber(tables.literal, bits);
+
+			if (symbol < 256) {
+				window[write++] = symbol;
+				continue;
+			}
+
+			if (symbol === 256) {
+				filters.push(parseFilter(bits, write));
+				continue;
+			}
+
+			if (symbol === 257) {
+				if (lastLength !== 0) {
+					copy(lastLength, distCache[0]);
+				}
+				continue;
+			}
+
+			if (symbol < 262) {
+				// a match reusing one of the cached distances
+				const cacheIndex = symbol - 258;
+				const distance = distCache[cacheIndex];
+				for (let idx = cacheIndex; idx > 0; idx--) {
+					distCache[idx] = distCache[idx - 1];
+				}
+				distCache[0] = distance;
+
+				const length = decodeLength(decodeNumber(tables.repeatDistance, bits), bits);
+				lastLength = length;
+				copy(length, distance);
+				continue;
+			}
+
+			// a match with a freshly coded distance
+			let length = decodeLength(symbol - 262, bits);
+			const slot = decodeNumber(tables.distance, bits);
+
+			let distance = 1;
+			let extraBits = 0;
+			if (slot < 4) {
+				distance += slot;
+			} else {
+				extraBits = (slot >> 1) - 1;
+				distance += (2 | (slot & 1)) << extraBits;
+			}
+
+			if (extraBits > 0) {
+				if (extraBits >= 4) {
+					if (extraBits > 4) {
+						const high = bits.peek32();
+						bits.skip(extraBits - 4);
+						distance += (high >>> (36 - extraBits)) << 4;
+					}
+					distance += decodeNumber(tables.lowDistance, bits);
+				} else {
+					distance += bits.read(extraBits);
+				}
+			}
+
+			// longer distances imply the encoder spent fewer length codes.
+			if (distance > 0x100) {
+				length++;
+				if (distance > 0x2000) {
+					length++;
+					if (distance > 0x40000) {
+						length++;
+					}
+				}
+			}
+
+			distCache[3] = distCache[2];
+			distCache[2] = distCache[1];
+			distCache[1] = distCache[0];
+			distCache[0] = distance;
+			lastLength = length;
+			copy(length, distance);
+		}
+
+		if (header.lastBlock) {
+			break;
+		}
+	}
+
+	if (write !== unpackedSize) {
+		throw new Error(`decompressed ${write} bytes, expected ${unpackedSize}`);
+	}
+
+	if (filters.length === 0) {
+		return window;
+	}
+
+	// stitch the output from raw window segments and filter-transformed ones.
+	// the format guarantees filters are ordered and non-overlapping.
+	const output = new Uint8Array(unpackedSize);
+	let cursor = 0;
+
+	for (const filter of filters) {
+		output.set(window.subarray(cursor, filter.blockStart), cursor);
+		output.set(runFilter(filter, window), filter.blockStart);
+		cursor = filter.blockStart + filter.blockLength;
+	}
+
+	output.set(window.subarray(cursor), cursor);
+
+	return output;
+};
+
+// #endregion
