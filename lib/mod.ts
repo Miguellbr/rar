@@ -9,3 +9,5 @@
 
 export type * from './reader/types.ts';
 export * from './reader/common.ts';
+
+export * from './rar5/extract.ts';
