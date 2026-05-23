@@ -278,13 +278,24 @@ const formatIso = (time: RarTime): string => {
 
 // #region archive dump
 
-const dumpFile = (block: FileBlock, lines: string[]): void => {
+// data about a file entry that the dump aggregates across split blocks: the
+// head block contributes the immutable metadata, later continuations bump the
+// compressed size and overwrite the CRC with the final volume's value.
+interface AggregatedFile {
+	head: FileBlock;
+	compressedSize: number;
+	volume: number;
+	crc: number | undefined;
+}
+
+const dumpFile = (entry: AggregatedFile, lines: string[]): void => {
+	const block = entry.head;
 	const rftype = (isFile(block) ? 'F' : '-') +
 		(isDirectory(block) ? 'D' : '-') +
 		(isSymlink(block) ? 'L' : '-');
 
 	lines.push(
-		`R5_FILE: hdrlen=${block.headerSize} datlen=${block.dataSize}` +
+		`R5_FILE: hdrlen=${block.headerSize} datlen=${entry.compressedSize}` +
 			` hdr_extra=${block.blockExtraSize} is=${rftype}`,
 	);
 	lines.push(
@@ -306,11 +317,11 @@ const dumpFile = (block: FileBlock, lines: string[]): void => {
 	lines.push(
 		`  os=${block.hostOs}:${block.hostOs === 1 ? 'UNIX' : 'WINDOWS'}` +
 			` mode=${renderMode(block.hostOs, block.attributes)}` +
-			` cmp=${block.dataSize} dec=${block.unpackedSize} vol=0`,
+			` cmp=${entry.compressedSize} dec=${block.unpackedSize} vol=${entry.volume}`,
 	);
 
-	if (block.crc !== undefined) {
-		lines.push(`  crc=0x${block.crc.toString(16).padStart(8, '0')} (${block.crc})`);
+	if (entry.crc !== undefined) {
+		lines.push(`  crc=0x${entry.crc.toString(16).padStart(8, '0')} (${entry.crc})`);
 	}
 	if (block.hash !== undefined) {
 		lines.push(`  blake2sp=${block.hash.value.toHex()}`);
@@ -384,8 +395,14 @@ export const dumpArchive = async (
 ): Promise<string> => {
 	const lines: string[] = [`Archive: ${archivePath}`];
 
-	const files: FileBlock[] = [];
+	const readers: readonly Reader[] = Array.isArray(source) ? source : [source];
+	const isSingleReader = !Array.isArray(source);
+
+	const entries: AggregatedFile[] = [];
+	const entriesByName = new Map<string, AggregatedFile>();
+	let openName: string | undefined;
 	let comment: string | undefined;
+	let firstMain: { volumeNumber: number | undefined } | undefined;
 
 	// the comment service block's data area may itself be encrypted, in which
 	// case the same key derivation path the walker uses for headers also
@@ -393,6 +410,19 @@ export const dumpArchive = async (
 	const keys = options?.password !== undefined ? new KeyCache(options.password) : undefined;
 
 	for await (const { reader, block } of walkArchive(source, options)) {
+		if (block.kind === 'main' && firstMain === undefined) {
+			firstMain = { volumeNumber: block.volumeNumber };
+			// a lone middle volume of a multi-volume set should print the same
+			// error dumprar does, before parsing any further blocks.
+			if (isSingleReader && block.volumeNumber !== undefined) {
+				lines.push(
+					` --- ${archivePath} is middle part of multi-vol archive` +
+						` (Need to start from first volume (current: ${block.volumeNumber}))---`,
+				);
+				return lines.join('\n') + '\n';
+			}
+		}
+
 		if (block.kind === 'service' && block.name === 'CMT') {
 			const split = block.blockFlags & (BlockFlag.splitBefore | BlockFlag.splitAfter);
 			const method = (block.compressionInfo >> 7) & 0x07;
@@ -423,9 +453,39 @@ export const dumpArchive = async (
 				comment = textDecoder.decode(nul === -1 ? raw : raw.subarray(0, nul));
 			}
 		} else if (block.kind === 'file') {
-			// superseded versions and split continuations never reach the name list
-			if (block.version === undefined && !(block.blockFlags & BlockFlag.splitBefore)) {
-				files.push(block);
+			// superseded versions are silently dropped from the listing.
+			if (block.version !== undefined) {
+				continue;
+			}
+
+			const splitBefore = (block.blockFlags & BlockFlag.splitBefore) !== 0;
+			const splitAfter = (block.blockFlags & BlockFlag.splitAfter) !== 0;
+
+			if (!splitBefore) {
+				const entry: AggregatedFile = {
+					compressedSize: block.dataSize,
+					crc: block.crc,
+					head: block,
+					volume: readers.indexOf(reader),
+				};
+				entries.push(entry);
+				entriesByName.set(block.name, entry);
+				openName = splitAfter ? block.name : undefined;
+			} else {
+				// a continuation extends the open split entry; if its name does not
+				// match the entry should not have been split here, but we mirror
+				// dumprar's lenient behaviour and just skip the orphan.
+				if (openName === undefined || openName !== block.name) {
+					continue;
+				}
+				const entry = entriesByName.get(openName);
+				if (entry !== undefined) {
+					entry.compressedSize += block.dataSize;
+					entry.crc = block.crc;
+				}
+				if (!splitAfter) {
+					openName = undefined;
+				}
 			}
 		}
 	}
@@ -434,8 +494,8 @@ export const dumpArchive = async (
 		lines.push(`  comment=${pyStringRepr(comment)}`);
 	}
 
-	for (const file of files) {
-		dumpFile(file, lines);
+	for (const entry of entries) {
+		dumpFile(entry, lines);
 	}
 
 	return lines.join('\n') + '\n';

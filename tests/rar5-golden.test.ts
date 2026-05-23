@@ -18,9 +18,17 @@ const CORPUS_PASSWORD = 'password';
 // tests/fixtures/rarfile/README.md and the corpus notes.
 const SKIP: Record<string, string> = {
 	'rar5-readonly-win.rar': 'misnamed RAR3 archive; belongs to the future RAR3 path',
-	'rar5-vols.part1.rar': 'multi-volume; needs volume-set walking',
-	'rar5-vols.part2.rar': 'multi-volume continuation part',
-	'rar5-vols.part3.rar': 'multi-volume continuation part',
+};
+
+// fixtures whose dump is driven by passing the whole volume set rather than a
+// single reader. for them, the corresponding `.exp` aggregates file metadata
+// across volumes.
+const VOLUME_SET: Record<string, readonly string[]> = {
+	'rar5-vols.part1.rar': [
+		'rar5-vols.part1.rar',
+		'rar5-vols.part2.rar',
+		'rar5-vols.part3.rar',
+	],
 };
 
 // reports the first line that differs, with a little surrounding context.
@@ -51,11 +59,15 @@ for (const name of fixtures) {
 		name: `rar5 golden dump: ${name}`,
 		ignore: skipReason !== undefined,
 		fn: async () => {
-			const data = Deno.readFileSync(new URL(name, FIXTURES_DIR));
 			const expected = Deno.readTextFileSync(new URL(`${name}.exp`, FIXTURES_DIR));
 			const password = name.includes('-hpsw') ? CORPUS_PASSWORD : undefined;
 
-			const actual = await dumpArchive(fromUint8Array(data), `test/files/${name}`, { password });
+			const volumeSet = VOLUME_SET[name];
+			const source = volumeSet !== undefined
+				? volumeSet.map((vol) => fromUint8Array(Deno.readFileSync(new URL(vol, FIXTURES_DIR))))
+				: fromUint8Array(Deno.readFileSync(new URL(name, FIXTURES_DIR)));
+
+			const actual = await dumpArchive(source, `test/files/${name}`, { password });
 
 			if (actual !== expected) {
 				throw new Error(`golden dump mismatch for ${name}\n${describeDiff(actual, expected)}`);
