@@ -702,7 +702,9 @@ export class Rar5Decoder {
 					distance += slot;
 				} else {
 					extraBits = (slot >> 1) - 1;
-					distance += (2 | (slot & 1)) << extraBits;
+					// slots 62-63 raise the addend past 2^30, where a signed shift
+					// would wrap negative and defeat the length-bonus checks below.
+					distance += (2 | (slot & 1)) * 2 ** extraBits;
 				}
 
 				if (extraBits > 0) {
