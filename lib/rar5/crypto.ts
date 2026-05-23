@@ -125,6 +125,46 @@ export const importAesKey = (keyBytes: Uint8Array<ArrayBuffer>): Promise<CryptoK
 	return crypto.subtle.importKey('raw', keyBytes, 'AES-CBC', false, ['decrypt', 'encrypt']);
 };
 
+/**
+ * applies RAR5's `ConvertHashToMAC` transform to a CRC32, used to verify
+ * encrypted entries with the TWEAKED checksum flag.
+ *
+ * RAR5 obscures an encrypted entry's CRC32 by HMAC-SHA256'ing its little-
+ * endian byte form under the entry's derived tweak (HMAC) key and folding
+ * the 32-byte digest down to 32 bits, four output bytes XOR'd into each
+ * 8-bit lane. comparing the stored tweaked CRC against this transform of
+ * the plaintext's natural CRC tells whether the decryption was correct.
+ *
+ * @param hmacKey the 32-byte tweak HMAC key from {@link deriveKeys}
+ * @param plainCrc the natural CRC32 of the entry's plaintext
+ * @returns the tweaked CRC32, as it appears in the archive header
+ */
+export const tweakCrc32 = async (
+	hmacKey: Uint8Array<ArrayBuffer>,
+	plainCrc: number,
+): Promise<number> => {
+	const rawCrc = new Uint8Array(4);
+	rawCrc[0] = plainCrc & 0xff;
+	rawCrc[1] = (plainCrc >>> 8) & 0xff;
+	rawCrc[2] = (plainCrc >>> 16) & 0xff;
+	rawCrc[3] = (plainCrc >>> 24) & 0xff;
+
+	const key = await crypto.subtle.importKey(
+		'raw',
+		hmacKey,
+		{ hash: 'SHA-256', name: 'HMAC' },
+		false,
+		['sign'],
+	);
+	const digest = new Uint8Array(await crypto.subtle.sign('HMAC', key, rawCrc));
+
+	let tweaked = 0;
+	for (let idx = 0; idx < 32; idx++) {
+		tweaked ^= digest[idx] << ((idx & 3) * 8);
+	}
+	return tweaked >>> 0;
+};
+
 // decrypts one CBC batch of `B` aligned bytes by appending a synthetic
 // PKCS#7-padded block so Web Crypto, which only does padded AES-CBC, returns
 // exactly `B` plaintext bytes. the synthetic block is `encrypt(empty)` keyed

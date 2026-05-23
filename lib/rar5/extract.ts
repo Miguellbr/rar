@@ -1,4 +1,5 @@
 import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
+import { crc32 } from '../utils/crc32.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
 
 import type { Reader } from '../reader/types.ts';
@@ -6,7 +7,7 @@ import type { FileBlock, FileEncryption } from './block.ts';
 import { isDirectory, isSymlink, parseBlock } from './block.ts';
 import { BlockFlag, COMPRESSION_SOLID, FileEncryptionFlag, RAR5_SIGNATURE } from './constants.ts';
 import type { DerivedKeys } from './crypto.ts';
-import { decryptAesCbc, decryptAesCbcStream, deriveKeys, importAesKey } from './crypto.ts';
+import { decryptAesCbc, decryptAesCbcStream, deriveKeys, importAesKey, tweakCrc32 } from './crypto.ts';
 import { Cursor } from './cursor.ts';
 import { Rar5Decoder } from './unpack.ts';
 
@@ -450,6 +451,14 @@ export class RarEntry {
 			source = streamSegments(this.#segments);
 		}
 
+		const chunks = await this.#runPipeline(source);
+		await this.#verifyCrc32(chunks);
+		return chunks;
+	}
+
+	async #runPipeline(
+		source: ReadableStream<Uint8Array<ArrayBuffer>>,
+	): Promise<Uint8Array<ArrayBuffer>[]> {
 		if (this.#decoder === undefined) {
 			// a stored entry's concatenated bytes are its content verbatim; an
 			// encrypted stored entry is CBC-padded to a 16-byte block, so the
@@ -479,6 +488,41 @@ export class RarEntry {
 			chunks.push(chunk);
 		});
 		return chunks;
+	}
+
+	// verifies the recorded CRC32 against the decoded plaintext, applying the
+	// TWEAKED transform for encrypted entries when set. silent when no CRC is
+	// recorded (e.g. blake-hashed entries) so callers that rely on that branch
+	// still see a clean read.
+	async #verifyCrc32(chunks: readonly Uint8Array<ArrayBuffer>[]): Promise<void> {
+		const stored = this.#finalCrc;
+		if (stored === undefined) {
+			return;
+		}
+
+		let computed = 0;
+		for (const chunk of chunks) {
+			computed = crc32(chunk, computed);
+		}
+
+		let expected = computed;
+		const encryption = this.#head.encryption;
+		if (
+			encryption !== undefined &&
+			(encryption.flags & FileEncryptionFlag.tweakedChecksums) !== 0 &&
+			this.#keys !== undefined
+		) {
+			const { derived } = await this.#keys.get(encryption.salt, encryption.kdfCount);
+			expected = await tweakCrc32(derived.hmacKey, computed);
+		}
+
+		if (expected !== stored) {
+			throw new Error(
+				`crc32 mismatch for ${this.#head.name}: ` +
+					`stored 0x${stored.toString(16).padStart(8, '0')}, ` +
+					`computed 0x${expected.toString(16).padStart(8, '0')}`,
+			);
+		}
 	}
 
 	// builds a stream of plaintext bytes from the entry's encrypted data area,

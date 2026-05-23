@@ -60,9 +60,12 @@ for (const name of fixtures) {
 					);
 				}
 
-				// the TWEAKED flag XORs the stored CRC with a HMAC of the
-				// plaintext, so a direct comparison is meaningful only for
-				// non-encrypted entries.
+				// non-encrypted entries: the stored CRC equals the plaintext
+				// CRC, so we re-check it here as a redundant guard against the
+				// library's internal verification regressing. encrypted entries
+				// use a TWEAKED CRC that bytes() already validates internally
+				// against the stored value, so a successful bytes() call below
+				// is itself proof of integrity.
 				if (entry.crc32 !== undefined && !entry.isEncrypted) {
 					const actual = crc32(bytes);
 					if (actual !== entry.crc32) {
