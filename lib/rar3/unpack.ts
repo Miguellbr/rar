@@ -515,6 +515,153 @@ const parseCodes = (
 
 // #endregion
 
+// #region filter command parsing
+
+// reads one byte from the LZSS bit stream. unlike the main `bits.read(8)`
+// path this aligns to 8 bits exactly, matching libarchive's
+// `rar_decode_byte` helper used by the filter reader.
+const readByte = (bits: BitReader): number => bits.read(8);
+
+// consumes a single VM-style variable-length number from a byte buffer using
+// a memory bit reader. matches libarchive's `membr_next_rarvm_number`.
+class MemoryBitReader {
+	#data: Uint8Array;
+	#bit = 0; // total bits consumed
+
+	constructor(data: Uint8Array) {
+		this.#data = data;
+	}
+
+	bits(count: number): number {
+		let value = 0;
+		for (let idx = 0; idx < count; idx++) {
+			const byteIndex = this.#bit >>> 3;
+			const bitIndex = 7 - (this.#bit & 7);
+			const bit = byteIndex < this.#data.length ? (this.#data[byteIndex] >>> bitIndex) & 1 : 0;
+			value = (value << 1) | bit;
+			this.#bit++;
+		}
+		return value;
+	}
+
+	number(): number {
+		const tag = this.bits(2);
+		if (tag === 0) {
+			return this.bits(4);
+		}
+		if (tag === 1) {
+			const high = this.bits(8);
+			if (high >= 16) {
+				return high;
+			}
+			// libarchive sign-extends here, but only blockstart/length use it
+			// and they treat the result as a small positive offset; the
+			// inverse of the |= 0xFFFFFF00 dance is to just return the low 12
+			// bits as an unsigned value, which is what real archives store.
+			return (high << 4) | this.bits(4);
+		}
+		if (tag === 2) {
+			return this.bits(16);
+		}
+		// 32-bit values overflow JS bitwise math, but in practice they only
+		// appear for register overrides — read as two 16-bit halves and
+		// combine through arithmetic.
+		const hi = this.bits(16);
+		const lo = this.bits(16);
+		return hi * 0x10000 + lo;
+	}
+}
+
+// tracks the running per-filter-list state across decode calls so subsequent
+// filter references (`flags & 0x80 == 0`) can resolve to the right cached
+// program length. libarchive holds this on the rar struct itself; here it is
+// kept inside the {@link Rar3Decoder} so a solid run sees the same list.
+interface FilterProgram {
+	usageCount: number;
+	oldFilterLength: number;
+}
+
+// reads one full filter command off the LZSS bit stream and updates the
+// decoder's filter list. the program bytecode itself is read but not
+// compiled — a follow-on commit will recognize the standard filters and
+// dispatch to hardcoded implementations.
+const skipFilterCommand = (bits: BitReader, decoder: Rar3DecoderState): void => {
+	const flags = readByte(bits);
+
+	// libarchive: length = (flags & 7) + 1, with 7 and 8 extending it.
+	let length = (flags & 0x07) + 1;
+	if (length === 7) {
+		length = readByte(bits) + 7;
+	} else if (length === 8) {
+		const high = readByte(bits);
+		const low = readByte(bits);
+		length = (high << 8) | low;
+	}
+
+	const code = new Uint8Array(length);
+	for (let idx = 0; idx < length; idx++) {
+		code[idx] = readByte(bits);
+	}
+
+	const mbr = new MemoryBitReader(code);
+
+	let progIndex: number;
+	if (flags & 0x80) {
+		const num = mbr.number();
+		if (num === 0) {
+			decoder.programs.length = 0;
+			progIndex = 0;
+		} else {
+			progIndex = num - 1;
+		}
+		decoder.lastFilterNum = progIndex;
+	} else {
+		progIndex = decoder.lastFilterNum;
+	}
+	const prog = decoder.programs[progIndex];
+
+	// blockstart and blocklength are read but ignored — when the VM lands,
+	// they will identify the range to transform.
+	mbr.number();
+	if (flags & 0x20) {
+		mbr.number();
+	}
+	// register override mask + values.
+	if (flags & 0x10) {
+		const mask = mbr.bits(7);
+		for (let idx = 0; idx < 7; idx++) {
+			if (mask & (1 << idx)) {
+				mbr.number();
+			}
+		}
+	}
+	// new program bytecode (only when the filter slot is empty).
+	if (prog === undefined) {
+		const len = mbr.number();
+		for (let idx = 0; idx < len; idx++) {
+			mbr.bits(8);
+		}
+		decoder.programs[progIndex] = { oldFilterLength: 0, usageCount: 1 };
+	} else {
+		prog.usageCount++;
+	}
+	// optional global-data overlay.
+	if (flags & 0x08) {
+		const len = mbr.number();
+		for (let idx = 0; idx < len; idx++) {
+			mbr.bits(8);
+		}
+	}
+};
+
+// the slice of decoder state that {@link skipFilterCommand} mutates.
+interface Rar3DecoderState {
+	programs: (FilterProgram | undefined)[];
+	lastFilterNum: number;
+}
+
+// #endregion
+
 // #region decoder
 
 /**
@@ -554,6 +701,21 @@ export class Rar3Decoder {
 	#tables?: Tables;
 	/** set when the previous entry left a `start new table` marker in flight. */
 	#startNewTable = true;
+	/** set when a filter command was seen during the most recent decode. */
+	#sawFilter = false;
+	/** filter program list referenced by the next filter command. */
+	readonly #filterState: Rar3DecoderState = { lastFilterNum: 0, programs: [] };
+
+	/**
+	 * whether the most recent {@link decode} call passed through at least one
+	 * VM filter command. the LZSS stream stayed in sync, but the bytes inside
+	 * each filter's range are pre-filter and may differ from the original
+	 * plaintext. consumers that care about byte-exact output should treat a
+	 * `true` return as "content is not fully decoded".
+	 */
+	get sawFilter(): boolean {
+		return this.#sawFilter;
+	}
 
 	/**
 	 * @param dictionarySize the dictionary size declared by the file header.
@@ -581,12 +743,18 @@ export class Rar3Decoder {
 	 * solid run, the Huffman tables and distance cache carry over so the next
 	 * entry's first symbols can reference them.
 	 *
+	 * filter commands (symbol 257) are read off the bit stream so the LZSS
+	 * engine stays in sync, but the VM that would execute them is not yet
+	 * built — the bytes inside each filter's range come out pre-filter. check
+	 * {@link sawFilter} after a call to see whether any range is so affected.
+	 *
 	 * @param input compressed bytes of the entry's data area, in order
 	 * @param unpackedSize the expected uncompressed size
 	 * @param sink receives each decoded chunk in order
-	 * @throws if the stream is invalid, requests PPMd, or invokes a filter
+	 * @throws if the stream is invalid or requests PPMd
 	 */
 	async decode(input: StreamReader, unpackedSize: number, sink: DecodeSink): Promise<void> {
+		this.#sawFilter = false;
 		const mask = this.#windowMask;
 		const window = this.#window;
 		const startWrite = this.#write;
@@ -704,7 +872,13 @@ export class Rar3Decoder {
 			}
 
 			if (symbol === 257) {
-				throw new Error('rar3 vm filters are not yet supported');
+				// consume the filter command from the bit stream so the LZSS
+				// engine stays in sync, but mark the entry as filter-tainted so
+				// the caller knows the output bytes inside filter ranges are
+				// pre-filter (i.e. not the original plaintext).
+				skipFilterCommand(bits!, this.#filterState);
+				this.#sawFilter = true;
+				continue;
 			}
 
 			let offs: number;

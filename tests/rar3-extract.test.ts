@@ -218,33 +218,25 @@ Deno.test({
 	},
 });
 
-Deno.test('rar3 extract: compressed entries with non-LZSS features throw gracefully', async () => {
-	// the encoder runs a VM filter ("just in case") on rar3-solid.rar and
-	// switches to PPMd on unicode.rar. listing the entries still works; only
-	// the body read surfaces a "not yet supported" error.
-	const fixtures: Array<{ name: string; needle: string }> = [
-		{ name: 'rar3-solid.rar', needle: 'vm filters' },
-		{ name: 'unicode.rar', needle: 'ppmd' },
-	];
+Deno.test('rar3 extract: PPMd entries throw gracefully', async () => {
+	// unicode.rar uses PPMd-H (not LZSS); listing still works but body reads
+	// surface a "not yet supported" error.
+	const data = Deno.readFileSync(new URL('unicode.rar', FIXTURES_DIR));
+	const reader = fromUint8Array(data);
 
-	for (const { name, needle } of fixtures) {
-		const data = Deno.readFileSync(new URL(name, FIXTURES_DIR));
-		const reader = fromUint8Array(data);
-
-		let threw = false;
-		try {
-			for await (const entry of unrar3(reader)) {
-				if (entry.isDirectory || entry.compressionMethod === 0x30) continue;
-				await entry.bytes();
-			}
-		} catch (error) {
-			threw = true;
-			if (!(error instanceof Error) || !error.message.includes(needle)) {
-				throw new Error(`${name}: unexpected error: ${error}`);
-			}
+	let threw = false;
+	try {
+		for await (const entry of unrar3(reader)) {
+			if (entry.isDirectory || entry.compressionMethod === 0x30) continue;
+			await entry.bytes();
 		}
-		if (!threw) {
-			throw new Error(`${name}: expected a "${needle}" error`);
+	} catch (error) {
+		threw = true;
+		if (!(error instanceof Error) || !error.message.includes('ppmd')) {
+			throw new Error(`unexpected error: ${error}`);
 		}
+	}
+	if (!threw) {
+		throw new Error('expected a "ppmd" error');
 	}
 });
