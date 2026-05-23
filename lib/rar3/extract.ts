@@ -336,14 +336,12 @@ export class Rar3Entry {
 			);
 		}
 
-		// compressed: hand the segments to the shared LZSS decoder. an empty
-		// expected size means nothing to do, but we still need to drain the
-		// stream so a later cached read does not see leftover bytes.
+		// compressed: hand the segments to the shared LZSS decoder. a 0-byte
+		// entry still goes through decode so the LZSS end-of-entry marker
+		// (which the encoder writes for every entry, regardless of size) is
+		// consumed — otherwise the next solid entry would read those bits as
+		// its own first symbol.
 		const chunks: Uint8Array<ArrayBuffer>[] = [];
-		if (expected === 0) {
-			return chunks;
-		}
-
 		await using reader = new StreamReader(source);
 		await this.#decoder.decode(reader, expected, (chunk) => {
 			chunks.push(chunk);

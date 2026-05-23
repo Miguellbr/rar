@@ -554,11 +554,11 @@ class MemoryBitReader {
 			if (high >= 16) {
 				return high;
 			}
-			// libarchive sign-extends here, but only blockstart/length use it
-			// and they treat the result as a small positive offset; the
-			// inverse of the |= 0xFFFFFF00 dance is to just return the low 12
-			// bits as an unsigned value, which is what real archives store.
-			return (high << 4) | this.bits(4);
+			// libarchive `membr_next_rarvm_number` sign-extends low-high values
+			// by OR-ing 0xFFFFFF00 into the 12-bit composite, producing a
+			// negative int32 for high<16. blockstart/blocklength consumers
+			// rely on the resulting negative offset.
+			return (0xffffff00 | (high << 4) | this.bits(4)) | 0;
 		}
 		if (tag === 2) {
 			return this.bits(16);
@@ -585,7 +585,18 @@ interface FilterProgram {
 // decoder's filter list. the program bytecode itself is read but not
 // compiled — a follow-on commit will recognize the standard filters and
 // dispatch to hardcoded implementations.
-const skipFilterCommand = (bits: BitReader, decoder: Rar3DecoderState): void => {
+//
+// the filter payload can be up to ~65 KiB long, far beyond the 16-byte
+// refill cushion the main LZSS loop maintains. `ensureBytes` is the same
+// refill closure the loop uses, called here to enlarge the bit reader's
+// backing buffer before each composite read.
+const skipFilterCommand = async (
+	bits: BitReader,
+	decoder: Rar3DecoderState,
+	ensureBytes: (count: number) => Promise<void>,
+): Promise<void> => {
+	// flags + up to a 2-byte extended length prefix.
+	await ensureBytes(3);
 	const flags = readByte(bits);
 
 	// libarchive: length = (flags & 7) + 1, with 7 and 8 extending it.
@@ -597,6 +608,10 @@ const skipFilterCommand = (bits: BitReader, decoder: Rar3DecoderState): void => 
 		const low = readByte(bits);
 		length = (high << 8) | low;
 	}
+
+	// the program bytecode is `length` bytes; reserve extra cushion so the
+	// next LZSS loop iteration's peek16/peek32 stays in-buffer too.
+	await ensureBytes(length + 16);
 
 	const code = new Uint8Array(length);
 	for (let idx = 0; idx < length; idx++) {
@@ -757,12 +772,22 @@ export class Rar3Decoder {
 		this.#sawFilter = false;
 		const mask = this.#windowMask;
 		const window = this.#window;
+		const windowSize = this.#windowSize;
 		const startWrite = this.#write;
 		const targetWrite = startWrite + unpackedSize;
+
+		// the longest single LZ copy is ~260 bytes (length base 224 + 31 extra
+		// + base bumps); leave generous headroom so periodic flushing always
+		// runs before the next iteration could overwrite unflushed window data.
+		const FLUSH_MARGIN = 512;
+		const FLUSH_HIGH_WATER = windowSize - FLUSH_MARGIN;
 
 		let emitted = startWrite;
 
 		// drain bytes from the window into one chunk and pass it to the sink.
+		// called periodically inside the loop so that the unflushed window slice
+		// never reaches `windowSize`, which would let later writes wrap over
+		// and overwrite bytes the sink has not yet received.
 		const flush = async (): Promise<void> => {
 			const end = Math.min(this.#write, targetWrite);
 			if (end <= emitted) {
@@ -786,23 +811,57 @@ export class Rar3Decoder {
 		const PAD = 8;
 		let bits: BitReader | undefined;
 
-		const refill = async (): Promise<boolean> => {
-			if (input.buffered === 0) {
-				try {
-					await input.require(1);
-				} catch {
-					return false;
+		// grows the bit reader's backing buffer until it has at least `count`
+		// bytes available past the current position (plus PAD). returns false
+		// when the source is exhausted before the requested cushion is met;
+		// the caller treats that as "no more input" rather than an error so
+		// the entry's completion can still be validated against expected size.
+		const ensureBytes = async (count: number): Promise<boolean> => {
+			while (bits === undefined || bits.addr + count > bits.data.length - PAD) {
+				if (input.buffered === 0) {
+					try {
+						await input.require(1);
+					} catch {
+						return false;
+					}
 				}
+				const take = Math.min(input.buffered, BLOCK_SIZE);
+				const chunk = input.take(take);
+				if (bits === undefined) {
+					const padded = new Uint8Array(chunk.length + PAD);
+					padded.set(chunk);
+					bits = new BitReader(padded);
+					continue;
+				}
+				const tail = bits.data.subarray(bits.addr, bits.data.length - PAD);
+				const carriedBit = bits.bit;
+				const merged = new Uint8Array(tail.length + chunk.length + PAD);
+				merged.set(tail);
+				merged.set(chunk, tail.length);
+				bits.rebind(merged);
+				bits.addr = 0;
+				bits.bit = carriedBit;
 			}
-			const take = Math.min(input.buffered, BLOCK_SIZE);
-			const chunk = input.take(take);
-			const padded = new Uint8Array(chunk.length + PAD);
-			padded.set(chunk);
-			bits = new BitReader(padded);
 			return true;
 		};
 
-		if (!await refill()) {
+		// `skipFilterCommand` calls ensureBytes too, but bits is rebound in
+		// place so its local reference stays valid. wrap it so the throwing
+		// `ensureBytes` variant is hidden behind a void-returning shim that
+		// the filter parser can `await` without worrying about exhaustion mid
+		// command (which would be a malformed archive).
+		const ensureBytesOrThrow = async (count: number): Promise<void> => {
+			if (!await ensureBytes(count)) {
+				throw new Error('rar3 filter command extends past end of compressed data');
+			}
+		};
+
+		if (!await ensureBytes(16)) {
+			if (unpackedSize === 0) {
+				// 0-byte entry with no data area: nothing to do. solid follow-ups
+				// will start cleanly because the bit position is unchanged.
+				return;
+			}
 			throw new Error('rar3 compressed data area is empty');
 		}
 		// at this point `bits` is set; assert for the type checker.
@@ -816,29 +875,27 @@ export class Rar3Decoder {
 			this.#write += length;
 		};
 
-		while (this.#write < targetWrite) {
-			// ensure the bit reader has at least 16 bytes of cushion past the
-			// current position; if not, pull a fresh slab and prepend the unread
-			// tail so peek32 keeps working across the boundary.
-			if (bits!.addr + 16 >= bits!.data.length - PAD) {
-				const tail = bits!.data.subarray(bits!.addr, bits!.data.length - PAD);
-				const carriedBit = bits!.bit;
-				if (input.buffered === 0) {
-					try {
-						await input.require(1);
-					} catch {
-						// no more input — fine if the running entry is satisfied.
-						break;
-					}
-				}
-				const take = Math.min(input.buffered, BLOCK_SIZE);
-				const chunk = input.take(take);
-				const merged = new Uint8Array(tail.length + chunk.length + PAD);
-				merged.set(tail);
-				merged.set(chunk, tail.length);
-				bits!.rebind(merged);
-				bits!.addr = 0;
-				bits!.bit = carriedBit;
+		// the loop terminates on the symbol-256 end-of-entry marker rather than
+		// on `write >= targetWrite`, so the marker is always consumed and a
+		// follow-up solid entry begins at a clean bit position. the
+		// write-overflow check at the top guards against malformed archives
+		// that emit literals past the declared size.
+		let endMarkerSeen = false;
+		while (!endMarkerSeen) {
+			if (this.#write > targetWrite) {
+				throw new Error(`rar3 wrote past expected ${unpackedSize} bytes`);
+			}
+
+			// keep at most `windowSize - 512` bytes unflushed so the next
+			// iteration's copy can't overwrite bytes that haven't reached the
+			// sink. for a small entry this typically only runs at the end.
+			if (this.#write - emitted >= FLUSH_HIGH_WATER) {
+				await flush();
+			}
+
+			if (!await ensureBytes(16)) {
+				// no more input — the caller validates write < targetWrite below.
+				break;
 			}
 
 			if (this.#startNewTable) {
@@ -862,6 +919,7 @@ export class Rar3Decoder {
 					// entry rebuilds Huffman tables or carries the current set
 					// over (solid runs typically carry).
 					this.#startNewTable = bits!.read(1) !== 0;
+					endMarkerSeen = true;
 					break;
 				}
 				// in-stream table change: re-parse codes against the same length
@@ -876,7 +934,7 @@ export class Rar3Decoder {
 				// engine stays in sync, but mark the entry as filter-tainted so
 				// the caller knows the output bytes inside filter ranges are
 				// pre-filter (i.e. not the original plaintext).
-				skipFilterCommand(bits!, this.#filterState);
+				await skipFilterCommand(bits!, this.#filterState, ensureBytesOrThrow);
 				this.#sawFilter = true;
 				continue;
 			}
