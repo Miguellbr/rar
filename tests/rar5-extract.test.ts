@@ -22,6 +22,9 @@ const SKIP = new Set([
 	'rar5-vols.part3.rar',
 ]);
 
+// the password rarfile's corpus uses for every password-protected fixture.
+const CORPUS_PASSWORD = 'password';
+
 const fixtures = [...Deno.readDirSync(FIXTURES_DIR)]
 	.map((entry) => entry.name)
 	.filter((name) => name.startsWith('rar5-') && name.endsWith('.rar'))
@@ -34,16 +37,18 @@ for (const name of fixtures) {
 		fn: async () => {
 			const data = Deno.readFileSync(new URL(name, FIXTURES_DIR));
 			const reader = fromUint8Array(data);
+			const password = name.includes('-psw') ? CORPUS_PASSWORD : undefined;
 
 			let entries = 0;
 			let verified = 0;
 
-			for await (const entry of unrar(reader)) {
+			for await (const entry of unrar(reader, { password })) {
 				entries++;
 
-				// directories, links, and encrypted data are not yet covered;
-				// everything else, stored or compressed (solid or not), is verified.
-				if (entry.isDirectory || entry.linkTarget !== undefined || entry.isEncrypted) {
+				// directories and links are not yet read back; everything else,
+				// stored or compressed (solid or not, encrypted or not), is
+				// verified by size.
+				if (entry.isDirectory || entry.linkTarget !== undefined) {
 					continue;
 				}
 
@@ -55,7 +60,10 @@ for (const name of fixtures) {
 					);
 				}
 
-				if (entry.crc32 !== undefined) {
+				// the TWEAKED flag XORs the stored CRC with a HMAC of the
+				// plaintext, so a direct comparison is meaningful only for
+				// non-encrypted entries.
+				if (entry.crc32 !== undefined && !entry.isEncrypted) {
 					const actual = crc32(bytes);
 					if (actual !== entry.crc32) {
 						throw new Error(
@@ -74,6 +82,70 @@ for (const name of fixtures) {
 		},
 	});
 }
+
+Deno.test('rar5 extract: rar5-psw stored and compressed entries decrypt to the same content', async () => {
+	const data = Deno.readFileSync(new URL('rar5-psw.rar', FIXTURES_DIR));
+	const reader = fromUint8Array(data);
+
+	const byName = new Map<string, Uint8Array>();
+	for await (const entry of unrar(reader, { password: CORPUS_PASSWORD })) {
+		byName.set(entry.filename, await entry.bytes());
+	}
+
+	const stest1 = byName.get('stest1.txt');
+	const stest2 = byName.get('stest2.txt');
+	if (stest1 === undefined || stest2 === undefined) {
+		throw new Error('expected both stest1.txt and stest2.txt');
+	}
+	if (stest1.length !== stest2.length) {
+		throw new Error(`size mismatch: stest1=${stest1.length} stest2=${stest2.length}`);
+	}
+	for (let idx = 0; idx < stest1.length; idx++) {
+		if (stest1[idx] !== stest2[idx]) {
+			throw new Error(`byte ${idx} differs: stest1=${stest1[idx]} stest2=${stest2[idx]}`);
+		}
+	}
+});
+
+Deno.test('rar5 extract: rar5-psw rejects a wrong password', async () => {
+	const data = Deno.readFileSync(new URL('rar5-psw.rar', FIXTURES_DIR));
+	const reader = fromUint8Array(data);
+
+	let threw = false;
+	try {
+		for await (const entry of unrar(reader, { password: 'wrong-password' })) {
+			await entry.bytes();
+		}
+	} catch (error) {
+		threw = true;
+		if (!(error instanceof Error) || !error.message.includes('check value')) {
+			throw new Error(`unexpected error: ${error}`);
+		}
+	}
+	if (!threw) {
+		throw new Error('expected a check-value error for the wrong password');
+	}
+});
+
+Deno.test('rar5 extract: rar5-psw rejects a missing password', async () => {
+	const data = Deno.readFileSync(new URL('rar5-psw.rar', FIXTURES_DIR));
+	const reader = fromUint8Array(data);
+
+	let threw = false;
+	try {
+		for await (const entry of unrar(reader)) {
+			await entry.bytes();
+		}
+	} catch (error) {
+		threw = true;
+		if (!(error instanceof Error) || !error.message.includes('password is required')) {
+			throw new Error(`unexpected error: ${error}`);
+		}
+	}
+	if (!threw) {
+		throw new Error('expected a missing-password error');
+	}
+});
 
 Deno.test('rar5 extract: rar5-vols multi-volume set', async () => {
 	const readers = ['rar5-vols.part1.rar', 'rar5-vols.part2.rar', 'rar5-vols.part3.rar'].map(

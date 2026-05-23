@@ -1,9 +1,11 @@
 import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
 
 import type { Reader } from '../reader/types.ts';
-import type { FileBlock } from './block.ts';
+import type { FileBlock, FileEncryption } from './block.ts';
 import { isDirectory, isSymlink, parseBlock } from './block.ts';
-import { BlockFlag, COMPRESSION_SOLID, RAR5_SIGNATURE } from './constants.ts';
+import { BlockFlag, COMPRESSION_SOLID, FileEncryptionFlag, RAR5_SIGNATURE } from './constants.ts';
+import type { DerivedKeys } from './crypto.ts';
+import { decryptAesCbc, deriveKeys, importAesKey } from './crypto.ts';
 import { Cursor } from './cursor.ts';
 import { Rar5Decoder } from './unpack.ts';
 
@@ -167,6 +169,58 @@ async function* walkVolumes(readers: readonly Reader[]): AsyncGenerator<VolumeFi
 	}
 }
 
+// a cache of keys derived for a given (password, salt, kdfCount) so that the
+// 32k-iteration KDF runs once per archive rather than once per encrypted
+// entry. the AES key handle is also cached so that Web Crypto only sees the
+// raw key bytes once.
+class KeyCache {
+	readonly #password: string;
+	readonly #entries = new Map<string, Promise<{ derived: DerivedKeys; aes: CryptoKey }>>();
+
+	constructor(password: string) {
+		this.#password = password;
+	}
+
+	get(salt: Uint8Array, kdfCount: number): Promise<{ derived: DerivedKeys; aes: CryptoKey }> {
+		// the salt is 16 bytes and the count is a single byte, so a hex-prefix
+		// key is unique and cheap to build.
+		let saltHex = '';
+		for (const byte of salt) {
+			saltHex += byte.toString(16).padStart(2, '0');
+		}
+
+		const cacheKey = `${kdfCount}:${saltHex}`;
+		const existing = this.#entries.get(cacheKey);
+		if (existing !== undefined) {
+			return existing;
+		}
+
+		const computed = (async () => {
+			const derived = await deriveKeys(this.#password, salt, kdfCount);
+			const aes = await importAesKey(derived.aesKey);
+			return { aes, derived };
+		})();
+		this.#entries.set(cacheKey, computed);
+		return computed;
+	}
+}
+
+// verifies a derived check value against the one stored in an entry's
+// encryption record. the stored value is 8 bytes of folded PBKDF2 output
+// plus the first 4 bytes of its SHA-256.
+const verifyCheckValue = (stored: Uint8Array, derived: Uint8Array): void => {
+	if (stored.length !== derived.length) {
+		throw new Error(`password does not match: check value length differs`);
+	}
+	let diff = 0;
+	for (let idx = 0; idx < stored.length; idx++) {
+		diff |= stored[idx] ^ derived[idx];
+	}
+	if (diff !== 0) {
+		throw new Error(`password does not match: check value mismatch`);
+	}
+};
+
 /**
  * a single file entry within a RAR5 archive.
  *
@@ -183,6 +237,7 @@ export class RarEntry {
 	readonly #segments: DataSegment[];
 	readonly #finalCrc: number | undefined;
 	readonly #decoder?: Rar5Decoder;
+	readonly #keys?: KeyCache;
 
 	#bytes?: Promise<Uint8Array<ArrayBuffer>>;
 
@@ -192,11 +247,13 @@ export class RarEntry {
 		segments: DataSegment[],
 		finalCrc: number | undefined,
 		decoder?: Rar5Decoder,
+		keys?: KeyCache,
 	) {
 		this.#head = head;
 		this.#segments = segments;
 		this.#finalCrc = finalCrc;
 		this.#decoder = decoder;
+		this.#keys = keys;
 	}
 
 	/**
@@ -324,18 +381,64 @@ export class RarEntry {
 	}
 
 	async #decode(): Promise<Uint8Array<ArrayBuffer>> {
-		if (this.#head.encryption !== undefined) {
-			throw new Error(`cannot read ${this.#head.name}: encrypted entries are not yet supported`);
+		const encryption = this.#head.encryption;
+
+		let compressed = await readSegments(this.#segments);
+
+		if (encryption !== undefined) {
+			compressed = await this.#decryptDataArea(encryption, compressed);
 		}
 
-		const compressed = await readSegments(this.#segments);
-
 		if (this.#decoder === undefined) {
-			// a stored entry's concatenated data segments are its content verbatim.
-			return compressed;
+			// a stored entry's concatenated data segments are its content
+			// verbatim; an encrypted stored entry is padded to a 16-byte block,
+			// so trim to the declared unpacked size.
+			const expected = this.#head.unpackedSize;
+			if (compressed.length === expected) {
+				return compressed;
+			}
+			if (compressed.length < expected) {
+				throw new Error(
+					`stored data is ${compressed.length} bytes, expected at least ${expected}`,
+				);
+			}
+			return new Uint8Array(compressed.buffer, compressed.byteOffset, expected);
 		}
 
 		return this.#decoder.decode(compressed, this.#head.unpackedSize);
+	}
+
+	// decrypts an entry's full ciphertext, verifying the stored password check
+	// value when present so the caller hears about a wrong password before any
+	// decompression attempt runs.
+	async #decryptDataArea(
+		encryption: FileEncryption,
+		ciphertext: Uint8Array<ArrayBuffer>,
+	): Promise<Uint8Array<ArrayBuffer>> {
+		if (this.#keys === undefined) {
+			throw new Error(
+				`cannot read ${this.#head.name}: a password is required for encrypted entries`,
+			);
+		}
+		if (encryption.algorithm !== 0) {
+			throw new Error(
+				`cannot read ${this.#head.name}: encryption algorithm ${encryption.algorithm} is not supported`,
+			);
+		}
+
+		const { aes, derived } = await this.#keys.get(encryption.salt, encryption.kdfCount);
+
+		if (
+			(encryption.flags & FileEncryptionFlag.hasCheckValue) !== 0 &&
+			encryption.checkValue !== undefined
+		) {
+			verifyCheckValue(encryption.checkValue, derived.checkValue);
+		}
+
+		// the IV (and the rest of the encryption record) was sliced out of the
+		// archive header bytes, whose array buffer is not exposed to Web Crypto's
+		// narrowed `BufferSource`; a 16-byte copy detaches it cleanly.
+		return await decryptAesCbc(aes, encryption.iv.slice(), ciphertext);
 	}
 
 	/**
@@ -422,6 +525,16 @@ export class RarEntry {
 	}
 }
 
+/** options controlling how {@link unrar} reads an archive. */
+export interface UnrarOptions {
+	/**
+	 * the password used to decrypt entries with encrypted data. password
+	 * derivation is cached per (salt, KDF count) pair, so the work runs once
+	 * for an archive even when many entries are encrypted.
+	 */
+	password?: string;
+}
+
 /**
  * extracts entries from a RAR5 archive.
  *
@@ -437,12 +550,17 @@ export class RarEntry {
  *
  * @param source one reader for a single-volume archive, or the ordered set of
  * volume readers for a multi-volume archive
+ * @param options optional settings such as the password for encrypted entries
  * @returns async generator yielding the archive's file entries
  * @throws if a volume is not a RAR5 archive, a header fails validation, or a
  * split file's continuation is missing
  */
-export async function* unrar(source: Reader | readonly Reader[]): AsyncGenerator<RarEntry> {
+export async function* unrar(
+	source: Reader | readonly Reader[],
+	options?: UnrarOptions,
+): AsyncGenerator<RarEntry> {
 	const readers: readonly Reader[] = Array.isArray(source) ? source : [source];
+	const keys = options?.password !== undefined ? new KeyCache(options.password) : undefined;
 
 	let decoder: Rar5Decoder | undefined;
 	let pending: RarEntry | undefined;
@@ -497,22 +615,22 @@ export async function* unrar(source: Reader | readonly Reader[]): AsyncGenerator
 		if (method === 0) {
 			// a stored entry is independent of any solid run; reading it does not
 			// touch the decoder's state.
-			entry = new RarEntry(head, segments, finalCrc);
+			entry = new RarEntry(head, segments, finalCrc, undefined, keys);
 		} else if (!solid) {
 			// the head of a (potentially solid) run gets a fresh decoder.
 			decoder = new Rar5Decoder(dictExp);
-			entry = new RarEntry(head, segments, finalCrc, decoder);
+			entry = new RarEntry(head, segments, finalCrc, decoder, keys);
 		} else if (decoder !== undefined) {
 			// a continuation of the current solid run; the previous entry must
 			// finish decoding so the shared window is in the right state.
 			if (pending !== undefined) {
 				await pending._drain();
 			}
-			entry = new RarEntry(head, segments, finalCrc, decoder);
+			entry = new RarEntry(head, segments, finalCrc, decoder, keys);
 		} else {
 			// a solid entry without a preceding run head; surface as an error at
 			// read time rather than silently producing wrong bytes.
-			entry = new RarEntry(head, segments, finalCrc);
+			entry = new RarEntry(head, segments, finalCrc, undefined, keys);
 		}
 
 		pending = entry;
