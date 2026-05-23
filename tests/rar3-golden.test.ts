@@ -1,0 +1,69 @@
+import { dumpArchive } from '../lib/rar3/dump.ts';
+
+/**
+ * @module
+ *
+ * golden-dump regression tests for the RAR3 block parser. each `.rar`
+ * fixture in the vendored rarfile corpus is dumped in dumprar's verbosity-1
+ * format and compared against its paired `.exp` file. fixtures that require
+ * archive- or entry-level comments, multi-volume aggregation, or
+ * encrypted-header handling are still skipped.
+ */
+
+const FIXTURES_DIR = new URL('./fixtures/rarfile/files/', import.meta.url);
+
+const SKIP: Record<string, string> = {
+	'ctime5.rar': 'actually a RAR5 archive (signature ends in 0x01); belongs to the RAR5 corpus',
+	'rar15-comment-lock.rar': 'RAR1.5 archive-level comment; sub-block dump not yet rendered',
+	'rar15-comment.rar': 'RAR1.5 archive-level comment; sub-block dump not yet rendered',
+	'rar202-comment-nopsw.rar': 'RAR2.0.2 archive-level comment; sub-block dump not yet rendered',
+	'rar202-comment-psw.rar': 'RAR2.0.2 encrypted archive comment; sub-block dump not yet rendered',
+	'rar3-comment-hpsw.rar': 'encrypted headers; needs RAR3 header decryption',
+	'rar3-comment-plain.rar': 'archive- and entry-level comments; sub-block dump not yet rendered',
+	'rar3-comment-psw.rar': 'encrypted comment; sub-block dump not yet rendered',
+	'rar3-old.r00': 'multi-volume continuation; aggregation not yet implemented',
+	'rar3-old.r01': 'multi-volume continuation; aggregation not yet implemented',
+	'rar3-old.rar': 'multi-volume head; aggregation not yet implemented',
+	'rar3-vols.part1.rar': 'multi-volume; aggregation not yet implemented',
+	'rar3-vols.part2.rar': 'multi-volume continuation; aggregation not yet implemented',
+	'rar3-vols.part3.rar': 'multi-volume continuation; aggregation not yet implemented',
+};
+
+const describeDiff = (actual: string, expected: string): string => {
+	const a = actual.split('\n');
+	const b = expected.split('\n');
+
+	for (let idx = 0; idx < Math.max(a.length, b.length); idx++) {
+		if (a[idx] !== b[idx]) {
+			return `first difference at line ${idx + 1}:\n` +
+				`  expected: ${JSON.stringify(b[idx])}\n` +
+				`  actual:   ${JSON.stringify(a[idx])}`;
+		}
+	}
+
+	return 'outputs differ in length only';
+};
+
+const fixtures = [...Deno.readDirSync(FIXTURES_DIR)]
+	.map((entry) => entry.name)
+	.filter((name) => /\.(rar|r00|r01)$/.test(name) && !name.startsWith('rar5-'))
+	.sort();
+
+for (const name of fixtures) {
+	const skipReason = SKIP[name];
+
+	Deno.test({
+		name: `rar3 golden dump: ${name}`,
+		ignore: skipReason !== undefined,
+		fn: () => {
+			const data = Deno.readFileSync(new URL(name, FIXTURES_DIR));
+			const expected = Deno.readTextFileSync(new URL(`${name}.exp`, FIXTURES_DIR));
+
+			const actual = dumpArchive(data, `test/files/${name}`);
+
+			if (actual !== expected) {
+				throw new Error(`golden dump mismatch for ${name}\n${describeDiff(actual, expected)}`);
+			}
+		},
+	});
+}

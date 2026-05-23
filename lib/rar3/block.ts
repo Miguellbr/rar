@@ -7,8 +7,6 @@
  * type-specific payload. data follows immediately after the header bytes.
  */
 
-import { textDecoder } from '../utils/buffer.ts';
-
 import { BlockFlag, BlockType, EndArcFlag, FileFlag, RAR3_SIGNATURE } from './constants.ts';
 
 // #region cursor
@@ -101,6 +99,14 @@ export interface MainBlock extends BlockCommon {
 	mainFlags: number;
 }
 
+/** a single high-precision timestamp parsed from the extended-time record. */
+export interface ExtTime {
+	/** the base DOS time, possibly bumped by 1 second per the spec's +sec flag */
+	time: DosTime;
+	/** sub-second remainder in nanoseconds, in the range [0, 1e9) */
+	nanos: number;
+}
+
 /** a file or sub-record entry. */
 export interface FileBlock extends BlockCommon {
 	kind: 'file' | 'sub';
@@ -114,6 +120,14 @@ export interface FileBlock extends BlockCommon {
 	crc: number;
 	/** modification time, decoded from the DOS-format field */
 	mtime: DosTime;
+	/** modification time with sub-second precision, when the EXTTIME flag is set */
+	extMtime?: ExtTime;
+	/** creation time, when an extended-time record contributes one */
+	ctime?: ExtTime;
+	/** access time, when an extended-time record contributes one */
+	atime?: ExtTime;
+	/** archival time, when an extended-time record contributes one */
+	arctime?: ExtTime;
 	/** required minimum unpack version (20-29 for RAR2.0 through RAR4) */
 	extractVersion: number;
 	/** compression method code (0x30 stored, 0x33 normal, 0x35 best, etc.) */
@@ -162,28 +176,32 @@ const decodeDosTime = (raw: number): DosTime => {
 	};
 };
 
-// rarfile's UnicodeFilename decoder: RAR3 stores unicode names as the
-// extended-ascii bytes (latin-1, typically the user's locale-encoded form)
-// followed by a NUL and a compressed-unicode tail describing high-byte
-// overrides. when the tail is absent or unparseable, the bytes before the NUL
-// are decoded as latin-1.
+// rarfile's UnicodeFilename decoder: RAR3 stores unicode names either as
+// straight UTF-8 (UNICODE flag, no NUL) or as a NUL-separated base + a
+// compressed-unicode tail that describes high-byte overrides for each
+// character in the base. when the tail is unparseable we fall back to UTF-8
+// of the base — matching rarfile's `_decode` fallback chain — and finally to
+// latin-1 as a last resort so a totally malformed name still round-trips.
 const decodeUnicodeName = (raw: Uint8Array): string => {
 	const nul = raw.indexOf(0);
 	if (nul === -1) {
-		// no NUL: the bytes are pure UTF-8.
-		return textDecoder.decode(raw);
+		return safeUtf8Decode(raw);
 	}
 
 	const base = raw.subarray(0, nul);
 	const tail = raw.subarray(nul + 1);
+	const decoded = tail.length > 0 ? decodeUnicodeTail(base, tail) : undefined;
+	return decoded ?? safeUtf8Decode(base);
+};
 
-	// no tail means just the latin-1 base.
-	if (tail.length === 0) {
-		return latin1Decode(base);
+// decodes `bytes` as UTF-8, falling back to latin-1 if the bytes contain a
+// sequence the decoder rejects.
+const safeUtf8Decode = (bytes: Uint8Array): string => {
+	try {
+		return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+	} catch {
+		return latin1Decode(bytes);
 	}
-
-	const decoded = decodeUnicodeTail(base, tail);
-	return decoded ?? latin1Decode(base);
 };
 
 // decodes the compressed-unicode tail produced by RAR2.x/3.x; based on
@@ -199,6 +217,8 @@ const decodeUnicodeTail = (base: Uint8Array, tail: Uint8Array): string | undefin
 	let flagBits = 0;
 	let flagByte = 0;
 
+	// each emitted value is a UTF-16 code unit; the input encodes them as
+	// (low, high) byte pairs, and the result is a UTF-16 little-endian string.
 	const out: number[] = [];
 
 	while (inPos < tail.length) {
@@ -211,18 +231,21 @@ const decodeUnicodeTail = (base: Uint8Array, tail: Uint8Array): string | undefin
 
 		switch (cmd) {
 			case 0: {
+				// low byte from the tail, high byte is zero
 				if (inPos >= tail.length) return undefined;
-				out.push(tail[inPos++] << 8);
+				out.push(tail[inPos++]);
 				outPos++;
 				break;
 			}
 			case 1: {
+				// low byte from the tail, high byte is the shared `hi`
 				if (inPos >= tail.length) return undefined;
 				out.push(highByte | tail[inPos++]);
 				outPos++;
 				break;
 			}
 			case 2: {
+				// full 16-bit value: low byte then high byte
 				if (inPos + 1 >= tail.length) return undefined;
 				out.push(tail[inPos] | (tail[inPos + 1] << 8));
 				inPos += 2;
@@ -233,6 +256,8 @@ const decodeUnicodeTail = (base: Uint8Array, tail: Uint8Array): string | undefin
 				if (inPos >= tail.length) return undefined;
 				const length = tail[inPos++];
 				if (length & 0x80) {
+					// run of `(length & 0x7f) + 2` code units copied from the base
+					// name with a single correction byte added and `hi` overlaid.
 					if (inPos >= tail.length) return undefined;
 					const correction = tail[inPos++];
 					for (let idx = 0; idx < (length & 0x7f) + 2; idx++) {
@@ -241,9 +266,11 @@ const decodeUnicodeTail = (base: Uint8Array, tail: Uint8Array): string | undefin
 						outPos++;
 					}
 				} else {
+					// run of `length + 2` code units copied from the base name
+					// verbatim with high byte zero — used for ASCII spans.
 					for (let idx = 0; idx < length + 2; idx++) {
 						if (outPos >= base.length) return undefined;
-						out.push(highByte | base[outPos]);
+						out.push(base[outPos]);
 						outPos++;
 					}
 				}
@@ -252,7 +279,10 @@ const decodeUnicodeTail = (base: Uint8Array, tail: Uint8Array): string | undefin
 		}
 	}
 
-	return String.fromCodePoint(...out);
+	// `out` is a sequence of UTF-16 code units; `fromCharCode` interprets each
+	// argument as one such unit, so a surrogate pair encoded as two consecutive
+	// code units becomes a single supplementary-plane character in the string.
+	return String.fromCharCode(...out);
 };
 
 const latin1Decode = (bytes: Uint8Array): string => {
@@ -301,14 +331,17 @@ const parseFileLikeBlock = (
 	}
 
 	const rawName = cursor.bytes(nameSize);
-	const name = (fileFlags & FileFlag.unicode) !== 0 ? decodeUnicodeName(rawName) : latin1Decode(rawName);
+	// names without the UNICODE flag are stored in either UTF-8 or the host
+	// OS's 8-bit charset; rarfile tries UTF-8 first and falls back to the
+	// default charset, and we do the same with latin-1 as the safety net.
+	const name = (fileFlags & FileFlag.unicode) !== 0 ? decodeUnicodeName(rawName) : safeUtf8Decode(rawName);
 
 	let salt: Uint8Array | undefined;
 	if ((fileFlags & FileFlag.salt) !== 0) {
 		salt = cursor.bytes(8);
 	}
 
-	return {
+	const block: FileBlock = {
 		...common,
 		attributes,
 		crc,
@@ -324,6 +357,77 @@ const parseFileLikeBlock = (
 		salt,
 		unpackedSize,
 	};
+
+	if ((fileFlags & FileFlag.extTime) !== 0 && cursor.remaining >= 2) {
+		parseExtTime(block, cursor);
+	}
+
+	return block;
+};
+
+// parses the optional extended-time record that follows the name (and any
+// per-file salt) when the EXTTIME flag is set. the record carries up to four
+// timestamps — mtime, ctime, atime, arctime — each with sub-second precision
+// and an optional whole-second correction.
+const parseExtTime = (block: FileBlock, cursor: Cursor): void => {
+	const flags = cursor.u16();
+
+	const mtimeNibble = (flags >>> 12) & 0x0f;
+	const ctimeNibble = (flags >>> 8) & 0x0f;
+	const atimeNibble = (flags >>> 4) & 0x0f;
+	const arctimeNibble = flags & 0x0f;
+
+	const ext = parseXTime(mtimeNibble, cursor, block.mtime);
+	if (ext !== undefined) {
+		block.extMtime = ext;
+	}
+	const ctime = parseXTime(ctimeNibble, cursor);
+	if (ctime !== undefined) {
+		block.ctime = ctime;
+	}
+	const atime = parseXTime(atimeNibble, cursor);
+	if (atime !== undefined) {
+		block.atime = atime;
+	}
+	const arctime = parseXTime(arctimeNibble, cursor);
+	if (arctime !== undefined) {
+		block.arctime = arctime;
+	}
+};
+
+// one extended timestamp nibble: bit 3 marks "present", bit 2 marks "+1
+// second" (to recover the half-second DOS time loses), bits 1-0 are the
+// count of fractional bytes (0-3), each contributing 8 bits of 100-ns ticks.
+const parseXTime = (nibble: number, cursor: Cursor, base?: DosTime): ExtTime | undefined => {
+	if ((nibble & 8) === 0) {
+		return undefined;
+	}
+
+	let time = base;
+	if (time === undefined) {
+		if (cursor.remaining < 4) {
+			return undefined;
+		}
+		time = decodeDosTime(cursor.u32());
+	}
+
+	const fracBytes = nibble & 3;
+	if (cursor.remaining < fracBytes) {
+		return undefined;
+	}
+
+	let rem = 0;
+	for (let idx = 0; idx < fracBytes; idx++) {
+		rem = (cursor.u8() << 16) | (rem >>> 8);
+	}
+
+	if ((nibble & 4) !== 0 && time.second < 59) {
+		time = { ...time, second: time.second + 1 };
+	}
+
+	// each unit of `rem` is 100 ns, with the value packed so the high bytes
+	// already represent the most significant fraction; multiply to nanoseconds.
+	return { nanos: rem * 100, time };
 };
 
 const parseMainBlock = (common: BlockCommon): MainBlock => {
