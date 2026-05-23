@@ -280,12 +280,21 @@ export class Rar3Entry {
 		return this.#finalCrc;
 	}
 
-	/** the last modification time, milliseconds since the unix epoch. */
+	/**
+	 * the last modification time, milliseconds since the unix epoch, or `NaN`
+	 * when the archive stored an unset / invalid DOS time. RAR3 timestamps are
+	 * local time; this getter treats them as UTC so the displayed wall-clock
+	 * matches `date_time` lines in dumprar.
+	 */
 	get mtime(): number {
 		const ext = this.#head.extMtime;
 		const time = ext?.time ?? this.#head.mtime;
-		// RAR3 timestamps are local time; treat them as UTC for the conversion
-		// so the displayed wall-clock matches `date_time` lines in dumprar.
+		// DOS month/day are 1-based; some encoders write 0 for "unknown".
+		// surface that as NaN rather than silently rolling into the previous
+		// year via Date.UTC(year, -1, 0, ...).
+		if (time.month < 1 || time.month > 12 || time.day < 1 || time.day > 31) {
+			return Number.NaN;
+		}
 		return Date.UTC(time.year, time.month - 1, time.day, time.hour, time.minute, time.second) +
 			Math.floor((ext?.nanos ?? 0) / 1e6);
 	}
