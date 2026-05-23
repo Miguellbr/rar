@@ -1,4 +1,4 @@
-import { decodeUtf8From, read } from '../utils/buffer.ts';
+import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
 
 import type { Reader } from '../reader/types.ts';
 import type { FileBlock } from './block.ts';
@@ -11,7 +11,9 @@ import { Rar5Decoder } from './unpack.ts';
  * @module
  *
  * sequential extraction of RAR5 archives. {@link unrar} walks an archive's
- * block headers and yields a {@link RarEntry} for each file it contains.
+ * block headers and yields a {@link RarEntry} for each file it contains, and
+ * for multi-volume archives stitches a file's data segments across volumes
+ * into a single logical entry.
  */
 
 // reads exactly `length` bytes from the reader at `offset`.
@@ -56,8 +58,78 @@ const deferStream = (
 	});
 };
 
-// walks the block headers of a RAR5 archive, reading only header bytes.
-async function* walkArchive(reader: Reader): AsyncGenerator<FileBlock> {
+// a slice of an entry's data area within a single volume.
+interface DataSegment {
+	reader: Reader;
+	offset: number;
+	size: number;
+}
+
+// reads the bytes of a single segment.
+const readSegment = (segment: DataSegment): Promise<Uint8Array<ArrayBuffer>> => {
+	return readBytes(segment.reader, segment.offset, segment.size);
+};
+
+// concatenates the bytes of every data segment into one buffer. used to feed
+// the decompressor when an entry's data is split across multiple volumes.
+const readSegments = async (segments: DataSegment[]): Promise<Uint8Array<ArrayBuffer>> => {
+	if (segments.length === 1) {
+		return await readSegment(segments[0]);
+	}
+
+	let total = 0;
+	for (const segment of segments) {
+		total += segment.size;
+	}
+
+	const chunks = await Promise.all(segments.map(readSegment));
+	return concat(chunks, total);
+};
+
+// pulls the bytes of every segment through one ReadableStream. for stored
+// entries this avoids buffering the whole payload in memory.
+const streamSegments = (segments: DataSegment[]): ReadableStream<Uint8Array> => {
+	let index = 0;
+	let current: ReadableStreamDefaultReader<Uint8Array> | undefined;
+
+	return new ReadableStream({
+		async pull(controller) {
+			for (;;) {
+				if (current === undefined) {
+					if (index === segments.length) {
+						controller.close();
+						return;
+					}
+
+					const segment = segments[index++];
+					current = (await segment.reader.read(segment.offset, segment.size)).getReader();
+				}
+
+				const { done, value } = await current.read();
+				if (done) {
+					current = undefined;
+					continue;
+				}
+
+				controller.enqueue(value);
+				return;
+			}
+		},
+		async cancel() {
+			await current?.cancel();
+		},
+	});
+};
+
+// a file block paired with the volume reader it came from. block.dataOffset
+// is relative to that reader.
+interface VolumeFileBlock {
+	reader: Reader;
+	block: FileBlock;
+}
+
+// walks the block headers of one RAR5 volume, reading only header bytes.
+async function* walkVolume(reader: Reader): AsyncGenerator<VolumeFileBlock> {
 	const signature = await readBytes(reader, 0, RAR5_SIGNATURE.length);
 	for (let idx = 0; idx < RAR5_SIGNATURE.length; idx++) {
 		if (signature[idx] !== RAR5_SIGNATURE[idx]) {
@@ -77,7 +149,7 @@ async function* walkArchive(reader: Reader): AsyncGenerator<FileBlock> {
 		const block = parseBlock(await readBytes(reader, offset, headerSize), offset);
 
 		if (block.kind === 'file') {
-			yield block;
+			yield { block, reader };
 		}
 
 		if (block.kind === 'endArc') {
@@ -88,26 +160,42 @@ async function* walkArchive(reader: Reader): AsyncGenerator<FileBlock> {
 	}
 }
 
+// walks every volume in order, yielding file blocks tagged with their reader.
+async function* walkVolumes(readers: readonly Reader[]): AsyncGenerator<VolumeFileBlock> {
+	for (const reader of readers) {
+		yield* walkVolume(reader);
+	}
+}
+
 /**
  * a single file entry within a RAR5 archive.
  *
  * metadata is available immediately; the entry's content is read lazily from
  * the archive when {@link RarEntry.body} or one of the convenience readers is
  * accessed. an entry that belongs to a solid run shares its decompression
- * state with the entries preceding it; the {@link unrar} iterator drives that
- * coordination so callers can simply consume entries in order.
+ * state with the entries preceding it, and an entry whose data is split
+ * across volumes spans multiple readers internally; the {@link unrar}
+ * iterator drives both kinds of coordination so callers can simply consume
+ * entries in order.
  */
 export class RarEntry {
-	readonly #reader: Reader;
-	readonly #block: FileBlock;
+	readonly #head: FileBlock;
+	readonly #segments: DataSegment[];
+	readonly #finalCrc: number | undefined;
 	readonly #decoder?: Rar5Decoder;
 
 	#bytes?: Promise<Uint8Array<ArrayBuffer>>;
 
 	/** @ignore */
-	constructor(reader: Reader, block: FileBlock, decoder?: Rar5Decoder) {
-		this.#reader = reader;
-		this.#block = block;
+	constructor(
+		head: FileBlock,
+		segments: DataSegment[],
+		finalCrc: number | undefined,
+		decoder?: Rar5Decoder,
+	) {
+		this.#head = head;
+		this.#segments = segments;
+		this.#finalCrc = finalCrc;
 		this.#decoder = decoder;
 	}
 
@@ -116,7 +204,7 @@ export class RarEntry {
 	 * @returns the entry name
 	 */
 	get filename(): string {
-		return this.#block.name;
+		return this.#head.name;
 	}
 
 	/**
@@ -124,15 +212,20 @@ export class RarEntry {
 	 * @returns size in bytes
 	 */
 	get size(): number {
-		return this.#block.unpackedSize;
+		return this.#head.unpackedSize;
 	}
 
 	/**
-	 * the size the entry occupies in the archive's data area.
+	 * the size the entry occupies across the archive's data area; for a split
+	 * entry this is the sum of every volume's contribution.
 	 * @returns size in bytes
 	 */
 	get compressedSize(): number {
-		return this.#block.dataSize;
+		let total = 0;
+		for (const segment of this.#segments) {
+			total += segment.size;
+		}
+		return total;
 	}
 
 	/**
@@ -140,7 +233,7 @@ export class RarEntry {
 	 * @returns the method code, 0 through 5
 	 */
 	get compressionMethod(): number {
-		return (this.#block.compressionInfo >> 7) & 0x07;
+		return (this.#head.compressionInfo >> 7) & 0x07;
 	}
 
 	/**
@@ -148,7 +241,7 @@ export class RarEntry {
 	 * @returns true for a directory entry
 	 */
 	get isDirectory(): boolean {
-		return isDirectory(this.#block);
+		return isDirectory(this.#head);
 	}
 
 	/**
@@ -156,7 +249,7 @@ export class RarEntry {
 	 * @returns true for a link entry
 	 */
 	get isSymlink(): boolean {
-		return isSymlink(this.#block);
+		return isSymlink(this.#head);
 	}
 
 	/**
@@ -164,7 +257,7 @@ export class RarEntry {
 	 * @returns the target path, or undefined for a non-link entry
 	 */
 	get linkTarget(): string | undefined {
-		return this.#block.redirection?.target;
+		return this.#head.redirection?.target;
 	}
 
 	/**
@@ -172,7 +265,7 @@ export class RarEntry {
 	 * @returns true for an encrypted entry
 	 */
 	get isEncrypted(): boolean {
-		return this.#block.encryption !== undefined;
+		return this.#head.encryption !== undefined;
 	}
 
 	/**
@@ -181,15 +274,25 @@ export class RarEntry {
 	 * @returns true for a solid entry
 	 */
 	get isSolid(): boolean {
-		return (this.#block.compressionInfo & COMPRESSION_SOLID) !== 0;
+		return (this.#head.compressionInfo & COMPRESSION_SOLID) !== 0;
 	}
 
 	/**
-	 * the data CRC32, when the archive records one.
+	 * whether the entry's data is split across multiple volumes.
+	 * @returns true for a multi-segment entry
+	 */
+	get isSplit(): boolean {
+		return this.#segments.length > 1;
+	}
+
+	/**
+	 * the data CRC32, when the archive records one. for a split entry this is
+	 * the running CRC from the final volume, covering the full reconstructed
+	 * content.
 	 * @returns the checksum, or undefined when absent
 	 */
 	get crc32(): number | undefined {
-		return this.#block.crc;
+		return this.#finalCrc;
 	}
 
 	/**
@@ -197,7 +300,7 @@ export class RarEntry {
 	 * @returns timestamp in milliseconds, or undefined when absent
 	 */
 	get mtime(): number | undefined {
-		const time = this.#block.mtime;
+		const time = this.#head.mtime;
 		return time !== undefined ? time.seconds * 1000 + Math.floor(time.nanos / 1e6) : undefined;
 	}
 
@@ -206,7 +309,7 @@ export class RarEntry {
 	 * @returns the attributes value
 	 */
 	get mode(): number {
-		return this.#block.attributes;
+		return this.#head.attributes;
 	}
 
 	// resolves to the entry's decompressed bytes, computing them once and
@@ -221,27 +324,34 @@ export class RarEntry {
 	}
 
 	async #decode(): Promise<Uint8Array<ArrayBuffer>> {
-		const block = this.#block;
-
-		if (block.encryption !== undefined) {
-			throw new Error(`cannot read ${block.name}: encrypted entries are not yet supported`);
+		if (this.#head.encryption !== undefined) {
+			throw new Error(`cannot read ${this.#head.name}: encrypted entries are not yet supported`);
 		}
 
-		const compressed = await readBytes(this.#reader, block.dataOffset, block.dataSize);
+		const compressed = await readSegments(this.#segments);
 
 		if (this.#decoder === undefined) {
-			// a stored entry's data area is its content verbatim.
+			// a stored entry's concatenated data segments are its content verbatim.
 			return compressed;
 		}
 
-		return this.#decoder.decode(compressed, block.unpackedSize);
+		return this.#decoder.decode(compressed, this.#head.unpackedSize);
 	}
 
 	/**
-	 * a readable stream of the entry's decompressed content.
+	 * a readable stream of the entry's decompressed content. for stored entries
+	 * this streams the raw data segments without buffering them in memory.
 	 * @returns a stream of the entry data
 	 */
 	get body(): ReadableStream<Uint8Array> {
+		// stored, never-yet-decoded entries can stream segment by segment.
+		if (
+			this.#decoder === undefined && this.#bytes === undefined &&
+			this.#head.encryption === undefined
+		) {
+			return streamSegments(this.#segments);
+		}
+
 		return deferStream(async () => {
 			const bytes = await this.#materialize();
 			return new ReadableStream({
@@ -315,56 +425,103 @@ export class RarEntry {
 /**
  * extracts entries from a RAR5 archive.
  *
- * the archive is read through `reader`; entries are yielded in archive order as
- * their headers are walked. superseded file versions and the trailing parts of
- * split files are omitted.
+ * the archive is read through `source`, which is either a single {@link Reader}
+ * for a self-contained archive or an ordered list of readers for the volumes
+ * of a multi-volume set. entries are yielded in archive order as their headers
+ * are walked; a file whose data spans volumes is yielded once after its final
+ * segment is seen. superseded file versions are omitted.
  *
  * entries that belong to a solid run share a single decompression window; the
  * iterator ensures the previous entry's body is materialized before yielding
  * the next solid entry, so consumers can treat them like any other entry.
  *
- * @param reader data source to read the archive from
+ * @param source one reader for a single-volume archive, or the ordered set of
+ * volume readers for a multi-volume archive
  * @returns async generator yielding the archive's file entries
- * @throws if the source is not a RAR5 archive or a header fails validation
+ * @throws if a volume is not a RAR5 archive, a header fails validation, or a
+ * split file's continuation is missing
  */
-export async function* unrar(reader: Reader): AsyncGenerator<RarEntry> {
+export async function* unrar(source: Reader | readonly Reader[]): AsyncGenerator<RarEntry> {
+	const readers: readonly Reader[] = Array.isArray(source) ? source : [source];
+
 	let decoder: Rar5Decoder | undefined;
 	let pending: RarEntry | undefined;
 
-	for await (const block of walkArchive(reader)) {
-		// superseded versions and split continuations are not standalone entries.
-		if (block.version !== undefined || (block.blockFlags & BlockFlag.splitBefore) !== 0) {
+	let openHead: FileBlock | undefined;
+	let openSegments: DataSegment[] = [];
+
+	for await (const { reader, block } of walkVolumes(readers)) {
+		// superseded versions never reach the listing.
+		if (block.version !== undefined) {
 			continue;
 		}
 
-		const method = (block.compressionInfo >> 7) & 0x07;
-		const solid = (block.compressionInfo & COMPRESSION_SOLID) !== 0;
-		const dictExp = (block.compressionInfo >> 10) & 0x0f;
+		const splitBefore = (block.blockFlags & BlockFlag.splitBefore) !== 0;
+		const splitAfter = (block.blockFlags & BlockFlag.splitAfter) !== 0;
+
+		if (splitBefore) {
+			if (openHead === undefined || openHead.name !== block.name) {
+				throw new Error(
+					`split continuation for ${block.name} without a preceding head; ` +
+						`the first volume may be missing`,
+				);
+			}
+			openSegments.push({ offset: block.dataOffset, reader, size: block.dataSize });
+		} else {
+			if (openHead !== undefined) {
+				throw new Error(
+					`new entry ${block.name} encountered while ${openHead.name} is still split; ` +
+						`a continuation volume may be missing`,
+				);
+			}
+			openHead = block;
+			openSegments = [{ offset: block.dataOffset, reader, size: block.dataSize }];
+		}
+
+		if (splitAfter) {
+			continue;
+		}
+
+		const head = openHead;
+		const segments = openSegments;
+		const finalCrc = block.crc;
+		openHead = undefined;
+		openSegments = [];
+
+		const method = (head.compressionInfo >> 7) & 0x07;
+		const solid = (head.compressionInfo & COMPRESSION_SOLID) !== 0;
+		const dictExp = (head.compressionInfo >> 10) & 0x0f;
 
 		let entry: RarEntry;
 
 		if (method === 0) {
 			// a stored entry is independent of any solid run; reading it does not
 			// touch the decoder's state.
-			entry = new RarEntry(reader, block);
+			entry = new RarEntry(head, segments, finalCrc);
 		} else if (!solid) {
 			// the head of a (potentially solid) run gets a fresh decoder.
 			decoder = new Rar5Decoder(dictExp);
-			entry = new RarEntry(reader, block, decoder);
+			entry = new RarEntry(head, segments, finalCrc, decoder);
 		} else if (decoder !== undefined) {
 			// a continuation of the current solid run; the previous entry must
 			// finish decoding so the shared window is in the right state.
 			if (pending !== undefined) {
 				await pending._drain();
 			}
-			entry = new RarEntry(reader, block, decoder);
+			entry = new RarEntry(head, segments, finalCrc, decoder);
 		} else {
 			// a solid entry without a preceding run head; surface as an error at
 			// read time rather than silently producing wrong bytes.
-			entry = new RarEntry(reader, block);
+			entry = new RarEntry(head, segments, finalCrc);
 		}
 
 		pending = entry;
 		yield entry;
+	}
+
+	if (openHead !== undefined) {
+		throw new Error(
+			`split file ${openHead.name} was not terminated; the final volume may be missing`,
+		);
 	}
 }

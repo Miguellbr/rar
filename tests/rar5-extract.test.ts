@@ -11,7 +11,9 @@ import { crc32 } from '../lib/utils/crc32.ts';
 
 const FIXTURES_DIR = new URL('./fixtures/rarfile/files/', import.meta.url);
 
-// fixtures the RAR5 extractor cannot yet handle; see the corpus notes.
+// fixtures the per-file extractor pass cannot exercise: encrypted headers,
+// the misnamed RAR3 file, and the multi-volume parts which only round-trip
+// when handed to unrar() together (covered separately below).
 const SKIP = new Set([
 	'rar5-hpsw.rar',
 	'rar5-readonly-win.rar',
@@ -72,6 +74,56 @@ for (const name of fixtures) {
 		},
 	});
 }
+
+Deno.test('rar5 extract: rar5-vols multi-volume set', async () => {
+	const readers = ['rar5-vols.part1.rar', 'rar5-vols.part2.rar', 'rar5-vols.part3.rar'].map(
+		(name) => fromUint8Array(Deno.readFileSync(new URL(name, FIXTURES_DIR))),
+	);
+
+	const seen: { name: string; size: number; split: boolean }[] = [];
+	for await (const entry of unrar(readers)) {
+		const bytes = await entry.bytes();
+
+		if (bytes.length !== entry.size) {
+			throw new Error(`${entry.filename} read ${bytes.length} bytes, expected ${entry.size}`);
+		}
+		if (entry.crc32 !== undefined && crc32(bytes) !== entry.crc32) {
+			throw new Error(`${entry.filename} crc32 mismatch`);
+		}
+
+		seen.push({ name: entry.filename, size: entry.size, split: entry.isSplit });
+	}
+
+	const expected = [
+		{ name: 'vols/bigfile.txt', size: 205000, split: true },
+		{ name: 'vols/smallfile.txt', size: 2050, split: false },
+	];
+	if (JSON.stringify(seen) !== JSON.stringify(expected)) {
+		throw new Error(`unexpected entries: ${JSON.stringify(seen)}`);
+	}
+});
+
+Deno.test('rar5 extract: rar5-vols rejects a standalone middle volume', async () => {
+	const reader = fromUint8Array(
+		Deno.readFileSync(new URL('rar5-vols.part2.rar', FIXTURES_DIR)),
+	);
+
+	let threw = false;
+	try {
+		for await (const _ of unrar(reader)) {
+			// the first file block in part2 has splitBefore set with no preceding head
+		}
+	} catch (error) {
+		threw = true;
+		if (!(error instanceof Error) || !error.message.includes('split continuation')) {
+			throw new Error(`unexpected error: ${error}`);
+		}
+	}
+
+	if (!threw) {
+		throw new Error('expected a standalone middle volume to be rejected');
+	}
+});
 
 Deno.test('rar5 extract: stored content round-trips', async () => {
 	const data = Deno.readFileSync(new URL('rar5-subdirs.rar', FIXTURES_DIR));
