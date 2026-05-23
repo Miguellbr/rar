@@ -6,8 +6,7 @@ import type { Reader } from '../reader/types.ts';
 import type { FileBlock, FileEncryption } from './block.ts';
 import { isDirectory, isSymlink, parseBlock } from './block.ts';
 import { BlockFlag, COMPRESSION_SOLID, FileEncryptionFlag, RAR5_SIGNATURE } from './constants.ts';
-import type { DerivedKeys } from './crypto.ts';
-import { decryptAesCbc, decryptAesCbcStream, deriveKeys, importAesKey, tweakCrc32 } from './crypto.ts';
+import { decryptAesCbc, decryptAesCbcStream, KeyCache, tweakCrc32, verifyCheckValue } from './crypto.ts';
 import { Cursor } from './cursor.ts';
 import { Rar5Decoder } from './unpack.ts';
 
@@ -105,11 +104,14 @@ const streamSegments = (segments: DataSegment[]): ReadableStream<Uint8Array<Arra
 	});
 };
 
-// a file block paired with the volume reader it came from. block.dataOffset
-// is relative to that reader.
-interface VolumeFileBlock {
+/**
+ * a parsed block paired with the volume reader it came from; `block.dataOffset`
+ * is relative to that reader and is corrected when the volume uses encrypted
+ * block headers.
+ */
+export interface VolumeBlock {
 	reader: Reader;
-	block: FileBlock;
+	block: import('./block.ts').Rar5Block;
 }
 
 // reads the header bytes of one block starting at `offset`, returning the
@@ -163,11 +165,12 @@ const readHeaderFrame = async (
 // walks the block headers of one RAR5 volume, reading only header bytes. when
 // the volume begins with an encryption header the walker derives the header
 // AES key from the supplied `keys` cache and decrypts every subsequent block
-// header before parsing it.
+// header before parsing it. every parsed block is yielded with its data offset
+// corrected for the on-disk header frame size.
 async function* walkVolume(
 	reader: Reader,
 	keys: KeyCache | undefined,
-): AsyncGenerator<VolumeFileBlock> {
+): AsyncGenerator<VolumeBlock> {
 	const signature = await readBytes(reader, 0, RAR5_SIGNATURE.length);
 	for (let idx = 0; idx < RAR5_SIGNATURE.length; idx++) {
 		if (signature[idx] !== RAR5_SIGNATURE[idx]) {
@@ -180,10 +183,12 @@ async function* walkVolume(
 
 	while (offset + 4 < reader.length) {
 		const { frameSize, headerBytes } = await readHeaderFrame(reader, offset, headerCipher);
-		const block = parseBlock(headerBytes, offset);
+		const parsed = parseBlock(headerBytes, offset);
 
-		// the data area follows the (possibly encrypted) header frame.
+		// the data area follows the whole (possibly encrypted) header frame, not
+		// just the cleartext header parseBlock saw.
 		const dataOffset = offset + frameSize;
+		const block = headerCipher === undefined ? parsed : { ...parsed, dataOffset };
 
 		if (block.kind === 'encryption') {
 			if (headerCipher !== undefined) {
@@ -205,9 +210,7 @@ async function* walkVolume(
 			headerCipher = aes;
 		}
 
-		if (block.kind === 'file') {
-			yield { block: headerCipher === undefined ? block : { ...block, dataOffset }, reader };
-		}
+		yield { block, reader };
 
 		if (block.kind === 'endArc') {
 			break;
@@ -217,66 +220,46 @@ async function* walkVolume(
 	}
 }
 
-// walks every volume in order, yielding file blocks tagged with their reader.
+// walks every volume in order, yielding every parsed block tagged with its
+// volume reader.
 async function* walkVolumes(
 	readers: readonly Reader[],
 	keys: KeyCache | undefined,
-): AsyncGenerator<VolumeFileBlock> {
+): AsyncGenerator<VolumeBlock> {
 	for (const reader of readers) {
 		yield* walkVolume(reader, keys);
 	}
 }
 
-// a cache of keys derived for a given (password, salt, kdfCount) so that the
-// 32k-iteration KDF runs once per archive rather than once per encrypted
-// entry. the AES key handle is also cached so that Web Crypto only sees the
-// raw key bytes once.
-class KeyCache {
-	readonly #password: string;
-	readonly #entries = new Map<string, Promise<{ derived: DerivedKeys; aes: CryptoKey }>>();
-
-	constructor(password: string) {
-		this.#password = password;
-	}
-
-	get(salt: Uint8Array, kdfCount: number): Promise<{ derived: DerivedKeys; aes: CryptoKey }> {
-		// the salt is 16 bytes and the count is a single byte, so a hex-prefix
-		// key is unique and cheap to build.
-		let saltHex = '';
-		for (const byte of salt) {
-			saltHex += byte.toString(16).padStart(2, '0');
-		}
-
-		const cacheKey = `${kdfCount}:${saltHex}`;
-		const existing = this.#entries.get(cacheKey);
-		if (existing !== undefined) {
-			return existing;
-		}
-
-		const computed = (async () => {
-			const derived = await deriveKeys(this.#password, salt, kdfCount);
-			const aes = await importAesKey(derived.aesKey);
-			return { aes, derived };
-		})();
-		this.#entries.set(cacheKey, computed);
-		return computed;
-	}
+/** options shared by archive walkers. */
+export interface WalkOptions {
+	/**
+	 * the password used to decrypt encrypted block headers. derivation is
+	 * cached per (salt, KDF count) pair, so the work runs once for an archive
+	 * even when many headers are encrypted.
+	 */
+	password?: string;
 }
 
-// verifies a derived check value against the one stored in an entry's
-// encryption record. the stored value is 8 bytes of folded PBKDF2 output
-// plus the first 4 bytes of its SHA-256.
-const verifyCheckValue = (stored: Uint8Array, derived: Uint8Array): void => {
-	if (stored.length !== derived.length) {
-		throw new Error(`password does not match: check value length differs`);
-	}
-	let diff = 0;
-	for (let idx = 0; idx < stored.length; idx++) {
-		diff |= stored[idx] ^ derived[idx];
-	}
-	if (diff !== 0) {
-		throw new Error(`password does not match: check value mismatch`);
-	}
+/**
+ * walks every parsed block of a RAR5 archive (or multi-volume set), yielding
+ * each block paired with the reader it came from. encrypted block headers are
+ * decrypted on the fly when a password is supplied; for an archive whose
+ * headers are not encrypted no password is needed.
+ *
+ * @param source one reader for a single-volume archive, or the ordered set of
+ * volume readers for a multi-volume archive
+ * @param options optional settings such as the password for encrypted headers
+ * @returns async generator yielding every block, with `block.dataOffset`
+ * corrected for the on-disk header frame size
+ */
+export const walkArchive = (
+	source: Reader | readonly Reader[],
+	options?: WalkOptions,
+): AsyncGenerator<VolumeBlock> => {
+	const readers: readonly Reader[] = Array.isArray(source) ? source : [source];
+	const keys = options?.password !== undefined ? new KeyCache(options.password) : undefined;
+	return walkVolumes(readers, keys);
 };
 
 /**
@@ -697,6 +680,10 @@ export async function* unrar(
 	let openSegments: DataSegment[] = [];
 
 	for await (const { reader, block } of walkVolumes(readers, keys)) {
+		if (block.kind !== 'file') {
+			continue;
+		}
+
 		// superseded versions never reach the listing.
 		if (block.version !== undefined) {
 			continue;

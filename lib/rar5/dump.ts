@@ -1,8 +1,11 @@
-import { textDecoder } from '../utils/buffer.ts';
+import { read, textDecoder } from '../utils/buffer.ts';
 
+import type { Reader } from '../reader/types.ts';
 import type { FileBlock, RarTime } from './block.ts';
-import { isDirectory, isFile, isSymlink, walkBlocks } from './block.ts';
-import { BlockFlag } from './constants.ts';
+import { isDirectory, isFile, isSymlink } from './block.ts';
+import { BlockFlag, FileEncryptionFlag } from './constants.ts';
+import { decryptAesCbcStream, KeyCache, verifyCheckValue } from './crypto.ts';
+import { walkArchive, type WalkOptions } from './extract.ts';
 
 /**
  * @module
@@ -236,15 +239,6 @@ const pyOptionalInt = (value: number | undefined): string => {
 
 // #region scalar formatting
 
-const hex = (bytes: Uint8Array): string => {
-	let out = '';
-	for (const byte of bytes) {
-		out += byte.toString(16).padStart(2, '0');
-	}
-
-	return out;
-};
-
 const pad2 = (value: number): string => String(value).padStart(2, '0');
 
 // breaks a timestamp into its UTC calendar fields.
@@ -319,7 +313,7 @@ const dumpFile = (block: FileBlock, lines: string[]): void => {
 		lines.push(`  crc=0x${block.crc.toString(16).padStart(8, '0')} (${block.crc})`);
 	}
 	if (block.hash !== undefined) {
-		lines.push(`  blake2sp=${hex(block.hash.value)}`);
+		lines.push(`  blake2sp=${block.hash.value.toHex()}`);
 	}
 	if (block.mtime !== undefined) {
 		lines.push(`  date_time=${formatDateTime(block.mtime)}`);
@@ -341,8 +335,8 @@ const dumpFile = (block: FileBlock, lines: string[]): void => {
 				` enc_flags=${enc.flags.toString(16).padStart(4, '0')}:` +
 				renderFlags(enc.flags, ENCRYPTION_FLAG_BITS) +
 				` kdf_lg=${enc.kdfCount} kdf_count=${1 << enc.kdfCount}` +
-				` salt=${hex(enc.salt)} iv=${hex(enc.iv)}` +
-				` checkval=${enc.checkValue !== undefined ? hex(enc.checkValue) : '-'}`,
+				` salt=${enc.salt.toHex()} iv=${enc.iv.toHex()}` +
+				` checkval=${enc.checkValue !== undefined ? enc.checkValue.toHex() : '-'}`,
 		);
 	}
 
@@ -377,23 +371,54 @@ const dumpFile = (block: FileBlock, lines: string[]): void => {
  * versions and the trailing parts of split files — matching how dumprar walks
  * an archive's name list.
  *
- * @param data the complete archive bytes
+ * @param source one reader for a single-volume archive, or the ordered set of
+ * volume readers for a multi-volume archive
  * @param archivePath path label to print on the leading `Archive:` line
+ * @param options optional settings such as the password for encrypted headers
  * @returns the dump text, newline-terminated
  */
-export const dumpArchive = (data: Uint8Array, archivePath: string): string => {
+export const dumpArchive = async (
+	source: Reader | readonly Reader[],
+	archivePath: string,
+	options?: WalkOptions,
+): Promise<string> => {
 	const lines: string[] = [`Archive: ${archivePath}`];
 
 	const files: FileBlock[] = [];
 	let comment: string | undefined;
 
-	for (const block of walkBlocks(data)) {
+	// the comment service block's data area may itself be encrypted, in which
+	// case the same key derivation path the walker uses for headers also
+	// applies here; the cache makes sure we don't repeat that work.
+	const keys = options?.password !== undefined ? new KeyCache(options.password) : undefined;
+
+	for await (const { reader, block } of walkArchive(source, options)) {
 		if (block.kind === 'service' && block.name === 'CMT') {
 			const split = block.blockFlags & (BlockFlag.splitBefore | BlockFlag.splitAfter);
 			const method = (block.compressionInfo >> 7) & 0x07;
 
 			if (!split && method === 0) {
-				const raw = data.subarray(block.dataOffset, block.dataOffset + block.dataSize);
+				let cipherStream = await reader.read(block.dataOffset, block.dataSize);
+				if (block.encryption !== undefined) {
+					if (keys === undefined) {
+						continue;
+					}
+					const enc = block.encryption;
+					if (enc.algorithm !== 0) {
+						continue;
+					}
+					const { aes, derived } = await keys.get(enc.salt, enc.kdfCount);
+					if (
+						(enc.flags & FileEncryptionFlag.hasCheckValue) !== 0 &&
+						enc.checkValue !== undefined
+					) {
+						verifyCheckValue(enc.checkValue, derived.checkValue);
+					}
+					cipherStream = decryptAesCbcStream(aes, enc.iv.slice(), cipherStream);
+				}
+				const raw = await read(cipherStream, block.dataSize);
+				// the comment is null-terminated within (possibly) CBC padding; cut
+				// at the first nul to drop both the terminator and any tail bytes.
 				const nul = raw.indexOf(0);
 				comment = textDecoder.decode(nul === -1 ? raw : raw.subarray(0, nul));
 			}

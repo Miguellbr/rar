@@ -126,6 +126,67 @@ export const importAesKey = (keyBytes: Uint8Array<ArrayBuffer>): Promise<CryptoK
 };
 
 /**
+ * verifies a derived check value against the one stored in an entry's
+ * encryption record. the stored value is 8 bytes of folded PBKDF2 output
+ * plus the first 4 bytes of its SHA-256.
+ *
+ * @param stored the 12-byte check value taken from the archive
+ * @param derived the 12-byte check value produced by {@link deriveKeys}
+ * @throws if the values differ in length or content
+ */
+export const verifyCheckValue = (stored: Uint8Array, derived: Uint8Array): void => {
+	if (stored.length !== derived.length) {
+		throw new Error(`password does not match: check value length differs`);
+	}
+	let diff = 0;
+	for (let idx = 0; idx < stored.length; idx++) {
+		diff |= stored[idx] ^ derived[idx];
+	}
+	if (diff !== 0) {
+		throw new Error(`password does not match: check value mismatch`);
+	}
+};
+
+/**
+ * a cache of keys derived for a given (password, salt, kdfCount) so that the
+ * 32k-iteration KDF runs once per archive rather than once per encrypted
+ * entry. the AES key handle is also cached so that Web Crypto only sees the
+ * raw key bytes once.
+ */
+export class KeyCache {
+	readonly #password: string;
+	readonly #entries = new Map<string, Promise<{ derived: DerivedKeys; aes: CryptoKey }>>();
+
+	constructor(password: string) {
+		this.#password = password;
+	}
+
+	/**
+	 * returns the AES key and derived material for a given salt and iteration
+	 * count, deriving them on first access and replaying the cached result on
+	 * later calls.
+	 *
+	 * @param salt the 16-byte salt from the entry's encryption record
+	 * @param kdfCount binary log of the iteration count
+	 */
+	get(salt: Uint8Array, kdfCount: number): Promise<{ derived: DerivedKeys; aes: CryptoKey }> {
+		const cacheKey = `${kdfCount}:${salt.toHex()}`;
+		const existing = this.#entries.get(cacheKey);
+		if (existing !== undefined) {
+			return existing;
+		}
+
+		const computed = (async () => {
+			const derived = await deriveKeys(this.#password, salt, kdfCount);
+			const aes = await importAesKey(derived.aesKey);
+			return { aes, derived };
+		})();
+		this.#entries.set(cacheKey, computed);
+		return computed;
+	}
+}
+
+/**
  * applies RAR5's `ConvertHashToMAC` transform to a CRC32, used to verify
  * encrypted entries with the TWEAKED checksum flag.
  *

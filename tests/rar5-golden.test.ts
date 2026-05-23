@@ -1,3 +1,4 @@
+import { fromUint8Array } from '../lib/reader/common.ts';
 import { dumpArchive } from '../lib/rar5/dump.ts';
 
 /**
@@ -10,10 +11,12 @@ import { dumpArchive } from '../lib/rar5/dump.ts';
 
 const FIXTURES_DIR = new URL('./fixtures/rarfile/files/', import.meta.url);
 
+// the password rarfile's corpus uses for every password-protected fixture.
+const CORPUS_PASSWORD = 'password';
+
 // fixtures that the RAR5 golden-dump harness cannot yet cover; see
 // tests/fixtures/rarfile/README.md and the corpus notes.
 const SKIP: Record<string, string> = {
-	'rar5-hpsw.rar': 'encrypted headers; needs the RAR5 header decryption path',
 	'rar5-readonly-win.rar': 'misnamed RAR3 archive; belongs to the future RAR3 path',
 	'rar5-vols.part1.rar': 'multi-volume; needs volume-set walking',
 	'rar5-vols.part2.rar': 'multi-volume continuation part',
@@ -47,11 +50,12 @@ for (const name of fixtures) {
 	Deno.test({
 		name: `rar5 golden dump: ${name}`,
 		ignore: skipReason !== undefined,
-		fn: () => {
+		fn: async () => {
 			const data = Deno.readFileSync(new URL(name, FIXTURES_DIR));
 			const expected = Deno.readTextFileSync(new URL(`${name}.exp`, FIXTURES_DIR));
+			const password = name.includes('-hpsw') ? CORPUS_PASSWORD : undefined;
 
-			const actual = dumpArchive(data, `test/files/${name}`);
+			const actual = await dumpArchive(fromUint8Array(data), `test/files/${name}`, { password });
 
 			if (actual !== expected) {
 				throw new Error(`golden dump mismatch for ${name}\n${describeDiff(actual, expected)}`);
