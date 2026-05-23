@@ -310,11 +310,19 @@ export const decryptAesCbcStream = (
 	// yet reached `STREAM_BATCH_BYTES`.
 	let pending: Uint8Array<ArrayBuffer> = new Uint8Array(0);
 	let sourceDone = false;
-	const reader = source.getReader();
+	// the reader is acquired lazily on first pull so a caller that constructs
+	// this stream and then drops it on an error path doesn't permanently lock
+	// the source's reader.
+	let reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>> | undefined;
+	let cancelled = false;
 
 	const appendPending = (chunk: Uint8Array<ArrayBuffer>): void => {
 		if (pending.length === 0) {
-			pending = chunk;
+			// copy rather than alias: a Reader that recycles its backing
+			// buffer between read() calls would otherwise mutate `pending`
+			// before the next decryptCbcBatch consumes it.
+			pending = new Uint8Array(chunk.length);
+			pending.set(chunk);
 			return;
 		}
 		const merged = new Uint8Array(pending.length + chunk.length);
@@ -325,6 +333,14 @@ export const decryptAesCbcStream = (
 
 	return new ReadableStream<Uint8Array<ArrayBuffer>>({
 		async pull(controller) {
+			if (reader === undefined) {
+				if (cancelled) {
+					controller.close();
+					return;
+				}
+				reader = source.getReader();
+			}
+
 			// gather enough buffered ciphertext for one decrypt call, unless the
 			// source has signalled completion — in which case whatever is left
 			// (and which must be 16-aligned at end-of-stream) is the final batch.
@@ -357,8 +373,9 @@ export const decryptAesCbcStream = (
 
 			controller.enqueue(plain);
 		},
-		async cancel() {
-			await reader.cancel();
+		async cancel(reason) {
+			cancelled = true;
+			await reader?.cancel(reason);
 		},
 	});
 };
