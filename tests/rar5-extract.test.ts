@@ -11,11 +11,10 @@ import { crc32 } from '../lib/utils/crc32.ts';
 
 const FIXTURES_DIR = new URL('./fixtures/rarfile/files/', import.meta.url);
 
-// fixtures the per-file extractor pass cannot exercise: encrypted headers,
-// the misnamed RAR3 file, and the multi-volume parts which only round-trip
-// when handed to unrar() together (covered separately below).
+// fixtures the per-file extractor pass cannot exercise: the misnamed RAR3
+// file and the multi-volume parts which only round-trip when handed to
+// unrar() together (covered separately below).
 const SKIP = new Set([
-	'rar5-hpsw.rar',
 	'rar5-readonly-win.rar',
 	'rar5-vols.part1.rar',
 	'rar5-vols.part2.rar',
@@ -37,7 +36,7 @@ for (const name of fixtures) {
 		fn: async () => {
 			const data = Deno.readFileSync(new URL(name, FIXTURES_DIR));
 			const reader = fromUint8Array(data);
-			const password = name.includes('-psw') ? CORPUS_PASSWORD : undefined;
+			const password = name.includes('-psw') || name.includes('-hpsw') ? CORPUS_PASSWORD : undefined;
 
 			let entries = 0;
 			let verified = 0;

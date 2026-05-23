@@ -130,8 +130,62 @@ interface VolumeFileBlock {
 	block: FileBlock;
 }
 
-// walks the block headers of one RAR5 volume, reading only header bytes.
-async function* walkVolume(reader: Reader): AsyncGenerator<VolumeFileBlock> {
+// reads the header bytes of one block starting at `offset`, returning the
+// cleartext bytes plus the number of bytes the block's header frame occupies
+// in the archive. for an encrypted-header archive the frame includes a leading
+// 16-byte IV and the rounded-up ciphertext; for a plain archive the frame is
+// just the header itself.
+const readHeaderFrame = async (
+	reader: Reader,
+	offset: number,
+	headerCipher: CryptoKey | undefined,
+): Promise<{ headerBytes: Uint8Array; frameSize: number }> => {
+	if (headerCipher === undefined) {
+		// the header size is only known once the CRC and the size vint are read.
+		const peek = await readBytes(reader, offset, Math.min(8, reader.length - offset));
+		const probe = new Cursor(peek);
+		probe.skip(4);
+		const headerSize = probe.vint() + probe.pos;
+
+		const headerBytes = await readBytes(reader, offset, headerSize);
+		return { frameSize: headerSize, headerBytes };
+	}
+
+	// encrypted header frame: [16-byte IV][ciphertext rounded to 16-byte multiple].
+	const iv = await readBytes(reader, offset, 16);
+	const firstEnc = await readBytes(reader, offset + 16, 16);
+	const firstDec = await decryptAesCbc(headerCipher, iv, firstEnc);
+
+	const probe = new Cursor(firstDec);
+	probe.skip(4);
+	const headerSize = probe.vint() + probe.pos;
+	const cipherSize = (headerSize + 15) & ~15;
+
+	if (cipherSize <= 16) {
+		const headerBytes = new Uint8Array(headerSize);
+		headerBytes.set(firstDec.subarray(0, headerSize));
+		return { frameSize: 16 + 16, headerBytes };
+	}
+
+	// the CBC chain continues from the first ciphertext block, which acts as
+	// the IV for the rest of the frame.
+	const restEnc = await readBytes(reader, offset + 16 + 16, cipherSize - 16);
+	const restDec = await decryptAesCbc(headerCipher, firstEnc, restEnc);
+
+	const headerBytes = new Uint8Array(headerSize);
+	headerBytes.set(firstDec);
+	headerBytes.set(restDec.subarray(0, headerSize - 16), 16);
+	return { frameSize: 16 + cipherSize, headerBytes };
+};
+
+// walks the block headers of one RAR5 volume, reading only header bytes. when
+// the volume begins with an encryption header the walker derives the header
+// AES key from the supplied `keys` cache and decrypts every subsequent block
+// header before parsing it.
+async function* walkVolume(
+	reader: Reader,
+	keys: KeyCache | undefined,
+): AsyncGenerator<VolumeFileBlock> {
 	const signature = await readBytes(reader, 0, RAR5_SIGNATURE.length);
 	for (let idx = 0; idx < RAR5_SIGNATURE.length; idx++) {
 		if (signature[idx] !== RAR5_SIGNATURE[idx]) {
@@ -140,32 +194,54 @@ async function* walkVolume(reader: Reader): AsyncGenerator<VolumeFileBlock> {
 	}
 
 	let offset = RAR5_SIGNATURE.length;
+	let headerCipher: CryptoKey | undefined;
 
 	while (offset + 4 < reader.length) {
-		// the header size is only known once the CRC and the size vint are read.
-		const peek = await readBytes(reader, offset, Math.min(8, reader.length - offset));
-		const probe = new Cursor(peek);
-		probe.skip(4);
-		const headerSize = probe.vint() + probe.pos;
+		const { frameSize, headerBytes } = await readHeaderFrame(reader, offset, headerCipher);
+		const block = parseBlock(headerBytes, offset);
 
-		const block = parseBlock(await readBytes(reader, offset, headerSize), offset);
+		// the data area follows the (possibly encrypted) header frame.
+		const dataOffset = offset + frameSize;
+
+		if (block.kind === 'encryption') {
+			if (headerCipher !== undefined) {
+				throw new Error(`unexpected nested encryption header`);
+			}
+			if (keys === undefined) {
+				throw new Error(`encrypted archive: a password is required`);
+			}
+			if (block.algorithm !== 0) {
+				throw new Error(
+					`encrypted archive: encryption algorithm ${block.algorithm} is not supported`,
+				);
+			}
+
+			const { aes, derived } = await keys.get(block.salt, block.kdfCount);
+			if (block.checkValue !== undefined) {
+				verifyCheckValue(block.checkValue, derived.checkValue);
+			}
+			headerCipher = aes;
+		}
 
 		if (block.kind === 'file') {
-			yield { block, reader };
+			yield { block: headerCipher === undefined ? block : { ...block, dataOffset }, reader };
 		}
 
 		if (block.kind === 'endArc') {
 			break;
 		}
 
-		offset = block.dataOffset + block.dataSize;
+		offset = dataOffset + block.dataSize;
 	}
 }
 
 // walks every volume in order, yielding file blocks tagged with their reader.
-async function* walkVolumes(readers: readonly Reader[]): AsyncGenerator<VolumeFileBlock> {
+async function* walkVolumes(
+	readers: readonly Reader[],
+	keys: KeyCache | undefined,
+): AsyncGenerator<VolumeFileBlock> {
 	for (const reader of readers) {
-		yield* walkVolume(reader);
+		yield* walkVolume(reader, keys);
 	}
 }
 
@@ -568,7 +644,7 @@ export async function* unrar(
 	let openHead: FileBlock | undefined;
 	let openSegments: DataSegment[] = [];
 
-	for await (const { reader, block } of walkVolumes(readers)) {
+	for await (const { reader, block } of walkVolumes(readers, keys)) {
 		// superseded versions never reach the listing.
 		if (block.version !== undefined) {
 			continue;
