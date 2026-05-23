@@ -8,6 +8,8 @@
  * format; it does not incorporate code from RARLAB's unrar.
  */
 
+import type { StreamReader } from '../utils/stream-reader.ts';
+
 // #region constants
 
 // huffman table sizes: bit-length codes, literals, distances, low distance
@@ -464,6 +466,13 @@ const decodeLength = (code: number, bits: BitReader): number => {
 };
 
 /**
+ * receives decoded chunks as they settle. chunks are owned by the sink once
+ * delivered; the decoder does not retain them. a sink that returns a promise
+ * pauses the decoder until the promise resolves, providing backpressure.
+ */
+export type DecodeSink = (chunk: Uint8Array<ArrayBuffer>) => void | Promise<void>;
+
+/**
  * a stateful RAR5 decoder.
  *
  * one instance carries the sliding window, repeat-distance cache, last match
@@ -472,8 +481,9 @@ const decodeLength = (code: number, bits: BitReader): number => {
  * calls represent the entries of a solid run sharing one decompression state.
  *
  * the window is sized from the dictionary exponent passed to the constructor
- * and is held internally as a circular buffer; entries' uncompressed output is
- * still returned as a contiguous, freshly allocated buffer.
+ * and is held internally as a circular buffer; an entry's uncompressed output
+ * is streamed to a sink in chunks as bytes settle, without ever buffering the
+ * whole entry, so entries larger than the window decode without trouble.
  */
 export class Rar5Decoder {
 	readonly #windowSize: number;
@@ -485,7 +495,14 @@ export class Rar5Decoder {
 	/** monotonic count of bytes ever written to the window */
 	#write = 0;
 	#tables?: Tables;
-	#filters: Filter[] = [];
+	/** filters whose range has not been fully written yet */
+	#pending: Filter[] = [];
+	/**
+	 * filters whose range is fully written and whose post-filter bytes are
+	 * computed, waiting to be overlaid on top of the emit chunks they cover.
+	 * keyed by the filter's `blockStart` in write-pointer coordinates.
+	 */
+	#ready: Map<number, Uint8Array> = new Map();
 
 	/**
 	 * @param dictionarySizeExponent the dictionary-size exponent from the entry's
@@ -499,21 +516,98 @@ export class Rar5Decoder {
 
 	/**
 	 * decodes the data area of one RAR5 file entry, appending its bytes to the
-	 * shared window.
+	 * shared window and emitting decoded chunks to `sink` as they settle.
 	 *
-	 * the returned buffer is a fresh allocation independent of the window, with
-	 * any pending filters whose range falls within the entry already applied.
+	 * compressed bytes are pulled from `input` one LZ block at a time, so the
+	 * full compressed payload never needs to be buffered. chunks are emitted
+	 * after each block, bounded above by the next pending filter's start so a
+	 * filter never has to rewrite bytes that were already sent. across a solid
+	 * run, the share of state carries over: pending filters of the previous
+	 * entry remain pending until their range completes in a later entry.
 	 *
-	 * @param compressed the entry's compressed data area
+	 * @param input compressed bytes of the entry's data area, in order
 	 * @param unpackedSize the expected uncompressed size
-	 * @returns the uncompressed bytes
-	 * @throws if the stream is invalid or uses a feature not yet supported
+	 * @param sink receives each decoded chunk in order
+	 * @throws if the stream is invalid, a filter straddles the entry boundary,
+	 * or unemitted bytes outstrip the dictionary window
 	 */
-	decode(compressed: Uint8Array, unpackedSize: number): Uint8Array<ArrayBuffer> {
+	async decode(input: StreamReader, unpackedSize: number, sink: DecodeSink): Promise<void> {
 		const mask = this.#windowMask;
 		const window = this.#window;
+		const windowSize = this.#windowSize;
 		const startWrite = this.#write;
 		const targetWrite = startWrite + unpackedSize;
+
+		let emitted = startWrite;
+
+		const flush = async (final: boolean): Promise<void> => {
+			// turn newly-completed filters into pre-computed overlay bytes. the
+			// filter reads from the window, so we must run it before the LZ loop
+			// overwrites its range.
+			{
+				const stillPending: Filter[] = [];
+				for (const filter of this.#pending) {
+					const fe = filter.blockStart + filter.blockLength;
+					if (fe > this.#write) {
+						stillPending.push(filter);
+						continue;
+					}
+					if (fe <= emitted) {
+						// the filter's range ended before any of the bytes we still
+						// owe; the original bytes are gone, but neither are they
+						// needed.
+						continue;
+					}
+					if (filter.blockStart < emitted) {
+						throw new Error(`filter range begins before already-emitted bytes`);
+					}
+					this.#ready.set(filter.blockStart, runFilter(filter, window, mask));
+				}
+				this.#pending = stillPending;
+			}
+
+			// emit up to the first byte that a still-pending filter will rewrite.
+			let safeEnd = final ? targetWrite : this.#write;
+			for (const filter of this.#pending) {
+				if (filter.blockStart < safeEnd) {
+					safeEnd = filter.blockStart;
+				}
+			}
+			if (safeEnd > targetWrite) {
+				safeEnd = targetWrite;
+			}
+			if (safeEnd <= emitted) {
+				return;
+			}
+
+			const size = safeEnd - emitted;
+			const chunk = new Uint8Array(size);
+			for (let idx = 0; idx < size; idx++) {
+				chunk[idx] = window[(emitted + idx) & mask];
+			}
+
+			// overlay any ready filter whose range intersects this chunk; one whose
+			// tail still lies past `safeEnd` keeps its remaining bytes around for
+			// the next emit cycle to apply.
+			for (const [fs, filtered] of this.#ready) {
+				const fe = fs + filtered.length;
+				const overlayStart = Math.max(fs, emitted);
+				const overlayEnd = Math.min(fe, safeEnd);
+				if (overlayEnd <= overlayStart) {
+					continue;
+				}
+				chunk.set(
+					filtered.subarray(overlayStart - fs, overlayEnd - fs),
+					overlayStart - emitted,
+				);
+				if (overlayEnd >= fe) {
+					this.#ready.delete(fs);
+				}
+			}
+
+			await sink(chunk);
+			emitted = safeEnd;
+		};
 
 		// the LZ copy primitive: bytes are written to the window modulo its
 		// size, and matches may overlap the write pointer so the loop must
@@ -525,15 +619,27 @@ export class Rar5Decoder {
 			this.#write += length;
 		};
 
-		let offset = 0;
-
 		while (this.#write < targetWrite) {
-			const header = parseBlockHeader(compressed, offset);
-			offset += header.headerSize;
+			// the block header is 3-5 bytes: 2 fixed (flags + checksum) plus 1-3
+			// little-endian size bytes. read the fixed pair first so the size
+			// nibble in `flags` tells us how many more to pull.
+			await input.require(2);
+			const headerProbe = input.take(2);
+			const sizeBytes = ((headerProbe[0] >> 3) & 7) + 1;
+			await input.require(sizeBytes);
+			const headerTail = input.take(sizeBytes);
 
+			const headerBuf = new Uint8Array(2 + sizeBytes);
+			headerBuf.set(headerProbe);
+			headerBuf.set(headerTail, 2);
+			const header = parseBlockHeader(headerBuf, 0);
+
+			// the LZ engine reads up to 4 bytes past the bit-stream end via
+			// peek32, so pad the block buffer with 8 zero bytes.
+			await input.require(header.blockSize);
+			const blockPayload = input.take(header.blockSize);
 			const block = new Uint8Array(header.blockSize + 8);
-			block.set(compressed.subarray(offset, offset + header.blockSize));
-			offset += header.blockSize;
+			block.set(blockPayload);
 
 			const bits = new BitReader(block);
 			if (header.tablePresent) {
@@ -560,7 +666,7 @@ export class Rar5Decoder {
 				}
 
 				if (symbol === 256) {
-					this.#filters.push(parseFilter(bits, this.#write));
+					this.#pending.push(parseFilter(bits, this.#write));
 					continue;
 				}
 
@@ -631,6 +737,18 @@ export class Rar5Decoder {
 				copy(length, distance);
 			}
 
+			await flush(false);
+
+			// once unemitted bytes outgrow the window, the LZ loop will start
+			// overwriting bytes the sink hasn't received yet. this usually means
+			// a filter range so large that it pins emission past the window;
+			// surface it cleanly rather than producing wrong bytes.
+			if (this.#write - emitted > windowSize) {
+				throw new Error(
+					`unemitted bytes (${this.#write - emitted}) exceed window size (${windowSize})`,
+				);
+			}
+
 			if (header.lastBlock) {
 				break;
 			}
@@ -640,50 +758,11 @@ export class Rar5Decoder {
 			throw new Error(`decompressed ${this.#write - startWrite} bytes, expected ${unpackedSize}`);
 		}
 
-		return this.#materialize(startWrite, unpackedSize);
-	}
+		await flush(true);
 
-	// copies the entry's bytes out of the window and applies any pending filters
-	// whose range falls within the entry. filters that ended before the entry
-	// started are discarded; ones that extend past the entry are kept for a
-	// later call. a filter that straddles the entry boundary is rejected.
-	#materialize(startWrite: number, unpackedSize: number): Uint8Array<ArrayBuffer> {
-		const mask = this.#windowMask;
-		const window = this.#window;
-		const endWrite = startWrite + unpackedSize;
-
-		const output = new Uint8Array(unpackedSize);
-		for (let idx = 0; idx < unpackedSize; idx++) {
-			output[idx] = window[(startWrite + idx) & mask];
+		if (emitted !== targetWrite) {
+			throw new Error(`pending filter prevents final emission past byte ${emitted - startWrite}`);
 		}
-
-		if (this.#filters.length === 0) {
-			return output;
-		}
-
-		const remaining: Filter[] = [];
-		for (const filter of this.#filters) {
-			const end = filter.blockStart + filter.blockLength;
-
-			if (end <= startWrite) {
-				// filter range already passed; the bytes are no longer in the window
-				continue;
-			}
-			if (filter.blockStart >= endWrite) {
-				remaining.push(filter);
-				continue;
-			}
-			if (filter.blockStart < startWrite || end > endWrite) {
-				throw new Error(`filter straddles entry boundary`);
-			}
-
-			const filtered = runFilter(filter, window, mask);
-			output.set(filtered, filter.blockStart - startWrite);
-		}
-
-		this.#filters = remaining;
-
-		return output;
 	}
 }
 

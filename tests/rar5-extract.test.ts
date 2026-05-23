@@ -1,4 +1,5 @@
 import { fromUint8Array } from '../lib/reader/common.ts';
+import { fromFsFile } from '../lib/reader/deno.ts';
 import { unrar } from '../lib/rar5/extract.ts';
 import { crc32 } from '../lib/utils/crc32.ts';
 
@@ -213,4 +214,73 @@ Deno.test('rar5 extract: stored content round-trips', async () => {
 	if (file.length === 0) {
 		throw new Error('expected sub/dir1/file1.txt to have content');
 	}
+});
+
+Deno.test({
+	name: 'rar5 extract: body streams compressed entries chunk by chunk',
+	permissions: { read: true },
+	fn: async () => {
+		// the split bigfile.txt across rar5-vols is the largest compressed entry
+		// in the corpus; consuming it through body via fromFsFile exercises the
+		// multi-volume input stream pulling lazily from disk and feeding the
+		// decoder one LZ block at a time, end to end.
+		const files = await Promise.all(
+			['rar5-vols.part1.rar', 'rar5-vols.part2.rar', 'rar5-vols.part3.rar'].map((name) =>
+				Deno.open(new URL(name, FIXTURES_DIR))
+			),
+		);
+		const readers = await Promise.all(files.map(fromFsFile));
+		try {
+			let bodyConsumed = false;
+
+			for await (const entry of unrar(readers)) {
+				if (entry.filename !== 'vols/bigfile.txt') {
+					await entry.bytes();
+					continue;
+				}
+
+				const collected: number[] = [];
+				let chunkCount = 0;
+
+				for await (const chunk of entry.body) {
+					chunkCount++;
+					for (const byte of chunk) {
+						collected.push(byte);
+					}
+				}
+
+				if (chunkCount < 2) {
+					throw new Error(`expected body to emit multiple chunks, got ${chunkCount}`);
+				}
+				if (collected.length !== entry.size) {
+					throw new Error(`body total ${collected.length} bytes, expected ${entry.size}`);
+				}
+
+				// reading body to completion populates the chunk cache, so bytes()
+				// returns the same content without a second decode pass.
+				const reread = await entry.bytes();
+				if (reread.length !== entry.size) {
+					throw new Error(`bytes after body read ${reread.length} bytes, expected ${entry.size}`);
+				}
+				for (let idx = 0; idx < reread.length; idx++) {
+					if (reread[idx] !== collected[idx]) {
+						throw new Error(`body and bytes disagree at byte ${idx}`);
+					}
+				}
+				if (entry.crc32 !== undefined && crc32(reread) !== entry.crc32) {
+					throw new Error(`bytes crc32 mismatch`);
+				}
+
+				bodyConsumed = true;
+			}
+
+			if (!bodyConsumed) {
+				throw new Error('did not find vols/bigfile.txt');
+			}
+		} finally {
+			for (const reader of readers) {
+				reader[Symbol.dispose]();
+			}
+		}
+	},
 });

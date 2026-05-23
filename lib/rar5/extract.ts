@@ -1,4 +1,5 @@
 import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
+import { StreamReader } from '../utils/stream-reader.ts';
 
 import type { Reader } from '../reader/types.ts';
 import type { FileBlock, FileEncryption } from './block.ts';
@@ -88,11 +89,23 @@ const readSegments = async (segments: DataSegment[]): Promise<Uint8Array<ArrayBu
 	return concat(chunks, total);
 };
 
+// wraps an in-memory buffer in a ReadableStream that emits it as one chunk.
+const bufferStream = (data: Uint8Array<ArrayBuffer>): ReadableStream<Uint8Array<ArrayBuffer>> => {
+	return new ReadableStream({
+		start(controller) {
+			if (data.length > 0) {
+				controller.enqueue(data);
+			}
+			controller.close();
+		},
+	});
+};
+
 // pulls the bytes of every segment through one ReadableStream. for stored
 // entries this avoids buffering the whole payload in memory.
-const streamSegments = (segments: DataSegment[]): ReadableStream<Uint8Array> => {
+const streamSegments = (segments: DataSegment[]): ReadableStream<Uint8Array<ArrayBuffer>> => {
 	let index = 0;
-	let current: ReadableStreamDefaultReader<Uint8Array> | undefined;
+	let current: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>> | undefined;
 
 	return new ReadableStream({
 		async pull(controller) {
@@ -315,7 +328,9 @@ export class RarEntry {
 	readonly #decoder?: Rar5Decoder;
 	readonly #keys?: KeyCache;
 
-	#bytes?: Promise<Uint8Array<ArrayBuffer>>;
+	// the entry's content as decoded chunks. populated by exactly one decode
+	// pass on first consumption; subsequent consumers replay from this cache.
+	#chunks?: Promise<Uint8Array<ArrayBuffer>[]>;
 
 	/** @ignore */
 	constructor(
@@ -445,43 +460,62 @@ export class RarEntry {
 		return this.#head.attributes;
 	}
 
-	// resolves to the entry's decompressed bytes, computing them once and
-	// caching the result. for an entry with a shared decoder, the iterator
-	// awaits this before yielding the next solid entry so the decoder state
-	// stays in sync with archive order.
-	#materialize(): Promise<Uint8Array<ArrayBuffer>> {
-		if (this.#bytes === undefined) {
-			this.#bytes = this.#decode();
+	// runs the one decode pass for this entry on first consumption and caches
+	// the resulting chunks; every later body/bytes/_drain call replays from the
+	// cache. for an entry with a shared solid-run decoder, the iterator awaits
+	// this before yielding the next solid entry so the decoder state stays in
+	// sync with archive order.
+	#materialize(): Promise<Uint8Array<ArrayBuffer>[]> {
+		if (this.#chunks === undefined) {
+			this.#chunks = this.#decode();
 		}
-		return this.#bytes;
+		return this.#chunks;
 	}
 
-	async #decode(): Promise<Uint8Array<ArrayBuffer>> {
+	async #decode(): Promise<Uint8Array<ArrayBuffer>[]> {
 		const encryption = this.#head.encryption;
 
-		let compressed = await readSegments(this.#segments);
-
+		// for an encrypted entry, the cipher pass still buffers the whole data
+		// area: Web Crypto's AES-CBC primitive is one-shot, so we read the
+		// segments fully, decrypt, and feed the cleartext to the decoder as if
+		// it were a single-chunk stream. streaming AES-CBC is a separate task.
+		let source: ReadableStream<Uint8Array<ArrayBuffer>>;
 		if (encryption !== undefined) {
-			compressed = await this.#decryptDataArea(encryption, compressed);
+			const ciphertext = await readSegments(this.#segments);
+			source = bufferStream(await this.#decryptDataArea(encryption, ciphertext));
+		} else {
+			source = streamSegments(this.#segments);
 		}
 
 		if (this.#decoder === undefined) {
-			// a stored entry's concatenated data segments are its content
-			// verbatim; an encrypted stored entry is padded to a 16-byte block,
-			// so trim to the declared unpacked size.
+			// a stored entry's concatenated bytes are its content verbatim; an
+			// encrypted stored entry is CBC-padded to a 16-byte block, so the
+			// drained payload may run past the declared size and must be trimmed.
 			const expected = this.#head.unpackedSize;
-			if (compressed.length === expected) {
-				return compressed;
+			const collected: Uint8Array<ArrayBuffer>[] = [];
+			let total = 0;
+			for await (const chunk of source) {
+				collected.push(chunk);
+				total += chunk.length;
 			}
-			if (compressed.length < expected) {
+			if (total < expected) {
 				throw new Error(
-					`stored data is ${compressed.length} bytes, expected at least ${expected}`,
+					`stored data is ${total} bytes, expected at least ${expected}`,
 				);
 			}
-			return new Uint8Array(compressed.buffer, compressed.byteOffset, expected);
+			if (total === expected) {
+				return collected.length === 1 ? collected : [concat(collected, total)];
+			}
+			const merged = collected.length === 1 ? collected[0] : concat(collected, total);
+			return [new Uint8Array(merged.buffer, merged.byteOffset, expected)];
 		}
 
-		return this.#decoder.decode(compressed, this.#head.unpackedSize);
+		const chunks: Uint8Array<ArrayBuffer>[] = [];
+		await using reader = new StreamReader(source);
+		await this.#decoder.decode(reader, this.#head.unpackedSize, (chunk) => {
+			chunks.push(chunk);
+		});
+		return chunks;
 	}
 
 	// decrypts an entry's full ciphertext, verifying the stored password check
@@ -518,25 +552,33 @@ export class RarEntry {
 	}
 
 	/**
-	 * a readable stream of the entry's decompressed content. for stored entries
-	 * this streams the raw data segments without buffering them in memory.
+	 * a readable stream of the entry's decompressed content. for an unencrypted
+	 * stored entry that has not yet been consumed elsewhere, segments stream
+	 * directly without buffering; otherwise the single decode pass runs and its
+	 * chunks are emitted in order.
 	 * @returns a stream of the entry data
 	 */
 	get body(): ReadableStream<Uint8Array> {
-		// stored, never-yet-decoded entries can stream segment by segment.
+		// an unencrypted stored entry can stream segment by segment without
+		// going through the decoder. once its chunks have been cached elsewhere
+		// (e.g. by bytes()), the cache path is cheaper.
 		if (
-			this.#decoder === undefined && this.#bytes === undefined &&
+			this.#decoder === undefined && this.#chunks === undefined &&
 			this.#head.encryption === undefined
 		) {
 			return streamSegments(this.#segments);
 		}
 
 		return deferStream(async () => {
-			const bytes = await this.#materialize();
+			const chunks = await this.#materialize();
+			let index = 0;
 			return new ReadableStream({
-				start(controller) {
-					controller.enqueue(bytes);
-					controller.close();
+				pull(controller) {
+					if (index < chunks.length) {
+						controller.enqueue(chunks[index++]);
+					} else {
+						controller.close();
+					}
 				},
 			});
 		});
@@ -547,7 +589,11 @@ export class RarEntry {
 	 * @returns the content as a Uint8Array
 	 */
 	async bytes(): Promise<Uint8Array<ArrayBuffer>> {
-		return await this.#materialize();
+		const chunks = await this.#materialize();
+		if (chunks.length === 1) {
+			return chunks[0];
+		}
+		return concat(chunks, this.#head.unpackedSize);
 	}
 
 	/**
