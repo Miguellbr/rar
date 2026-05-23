@@ -12,6 +12,8 @@
  * of RARLAB's unrar.
  */
 
+import { crc32 } from '../utils/crc32.ts';
+
 import type { StreamReader } from '../utils/stream-reader.ts';
 
 // #region constants
@@ -515,7 +517,52 @@ const parseCodes = (
 
 // #endregion
 
-// #region filter command parsing
+// #region filters
+
+// VM memory layout matches libarchive's PROGRAM_WORK_SIZE / VM_MEMORY_SIZE.
+// the filter source bytes go in `[0, blockLength)` and the standard filters
+// either rewrite in place (e8/e8e9) or write the result into
+// `[blockLength, 2*blockLength)`. the upper bound (256 KiB) caps the
+// per-filter range; archives that exceed it are malformed.
+const VM_MEMORY_SIZE = 0x40000;
+const PROGRAM_SYSTEM_GLOBAL_ADDRESS = 0x3c000;
+
+// the standard RAR3 filter programs that ship with WinRAR. each entry's
+// fingerprint is `(byteLength, crc32(bytecode))`; libarchive packs both into
+// a uint64 (`length << 32 | crc`) for the same purpose.
+const enum FilterKind {
+	Audio,
+	Delta,
+	E8,
+	E8E9,
+	Rgb,
+	Unknown,
+}
+
+const FILTER_FINGERPRINTS = new Map<string, FilterKind>([
+	[`29:${(0x0e06077d).toString(16)}`, FilterKind.Delta],
+	[`53:${(0xad576887).toString(16)}`, FilterKind.E8],
+	[`57:${(0x3cd7e57e).toString(16)}`, FilterKind.E8E9],
+	[`149:${(0x1c2c5dc8).toString(16)}`, FilterKind.Rgb],
+	[`216:${(0xbc85e701).toString(16)}`, FilterKind.Audio],
+]);
+
+const fingerprint = (bytecode: Uint8Array): FilterKind => {
+	const key = `${bytecode.length}:${crc32(bytecode).toString(16)}`;
+	return FILTER_FINGERPRINTS.get(key) ?? FilterKind.Unknown;
+};
+
+const readLe32 = (data: Uint8Array, offset: number): number => {
+	return (data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16) |
+		(data[offset + 3] << 24)) >>> 0;
+};
+
+const writeLe32 = (data: Uint8Array, offset: number, value: number): void => {
+	data[offset] = value;
+	data[offset + 1] = value >>> 8;
+	data[offset + 2] = value >>> 16;
+	data[offset + 3] = value >>> 24;
+};
 
 // reads one byte from the LZSS bit stream. unlike the main `bits.read(8)`
 // path this aligns to 8 bits exactly, matching libarchive's
@@ -572,27 +619,48 @@ class MemoryBitReader {
 	}
 }
 
-// tracks the running per-filter-list state across decode calls so subsequent
-// filter references (`flags & 0x80 == 0`) can resolve to the right cached
-// program length. libarchive holds this on the rar struct itself; here it is
-// kept inside the {@link Rar3Decoder} so a solid run sees the same list.
+// a compiled (well, fingerprinted) filter program. the program list lives on
+// the decoder state and is referenced by index in subsequent filter commands.
 interface FilterProgram {
+	kind: FilterKind;
 	usageCount: number;
 	oldFilterLength: number;
 }
 
-// reads one full filter command off the LZSS bit stream and updates the
-// decoder's filter list. the program bytecode itself is read but not
-// compiled — a follow-on commit will recognize the standard filters and
-// dispatch to hardcoded implementations.
+// a queued filter: its parsed parameters plus a pointer to the program. the
+// LZSS engine emits its filter list one at a time as the LZ output catches up
+// to each `blockStart`.
+interface PendingFilter {
+	prog: FilterProgram;
+	/** in monotonic write coordinates (shared across the solid run). */
+	blockStart: number;
+	blockLength: number;
+	/** registers[0..7]; non-zero entries come from the filter command. */
+	registers: Uint32Array;
+}
+
+// the slice of decoder state that {@link parseFilterCommand} mutates.
+interface Rar3DecoderState {
+	programs: (FilterProgram | undefined)[];
+	lastFilterNum: number;
+	stack: PendingFilter[];
+}
+
+// reads one full filter command off the LZSS bit stream, enrolling its program
+// in the decoder state on first sight and pushing a {@link PendingFilter} onto
+// the stack. the program bytecode is fingerprinted against the standard
+// WinRAR filter set; archives carrying a custom program raise an error at
+// execute time (parse still succeeds so the LZSS bit stream stays in sync).
 //
-// the filter payload can be up to ~65 KiB long, far beyond the 16-byte
-// refill cushion the main LZSS loop maintains. `ensureBytes` is the same
-// refill closure the loop uses, called here to enlarge the bit reader's
-// backing buffer before each composite read.
-const skipFilterCommand = async (
+// the filter payload can be up to ~65 KiB long, far beyond the 16-byte refill
+// cushion the main LZSS loop maintains. `ensureBytes` is the same refill
+// closure the loop uses, called here to enlarge the bit reader's backing
+// buffer before each composite read.
+const parseFilterCommand = async (
 	bits: BitReader,
-	decoder: Rar3DecoderState,
+	state: Rar3DecoderState,
+	lzssPosition: number,
+	windowSize: number,
 	ensureBytes: (count: number) => Promise<void>,
 ): Promise<void> => {
 	// flags + up to a 2-byte extended length prefix.
@@ -624,56 +692,257 @@ const skipFilterCommand = async (
 	if (flags & 0x80) {
 		const num = mbr.number();
 		if (num === 0) {
-			decoder.programs.length = 0;
+			state.programs.length = 0;
+			state.stack.length = 0;
 			progIndex = 0;
 		} else {
 			progIndex = num - 1;
 		}
-		decoder.lastFilterNum = progIndex;
+		if (progIndex > state.programs.length) {
+			throw new Error(`rar3 filter command references program ${progIndex} past list end`);
+		}
+		state.lastFilterNum = progIndex;
 	} else {
-		progIndex = decoder.lastFilterNum;
+		progIndex = state.lastFilterNum;
 	}
-	const prog = decoder.programs[progIndex];
+	let prog = state.programs[progIndex];
 
-	// blockstart and blocklength are read but ignored — when the VM lands,
-	// they will identify the range to transform.
-	mbr.number();
-	if (flags & 0x20) {
-		mbr.number();
+	// blockStart is signed (small-magnitude values come back negative through
+	// `mbr.number`'s sign extension) and adds onto the current LZSS write
+	// position; flag 0x40 bumps it by 258 (the "long form").
+	let blockStart = mbr.number() + lzssPosition;
+	if (flags & 0x40) {
+		blockStart += 258;
 	}
-	// register override mask + values.
+
+	let blockLength: number;
+	if (flags & 0x20) {
+		blockLength = mbr.number();
+	} else {
+		blockLength = prog?.oldFilterLength ?? 0;
+	}
+
+	if (blockLength > windowSize || blockLength > VM_MEMORY_SIZE) {
+		throw new Error(
+			`rar3 filter block length ${blockLength} exceeds window (${windowSize}) or VM cap`,
+		);
+	}
+
+	// libarchive's parse_filter seeds the register file with the system
+	// global address, the block length, and the program usage count.
+	const registers = new Uint32Array(8);
+	registers[3] = PROGRAM_SYSTEM_GLOBAL_ADDRESS;
+	registers[4] = blockLength;
+	registers[5] = prog?.usageCount ?? 0;
+	registers[7] = VM_MEMORY_SIZE;
+
 	if (flags & 0x10) {
 		const mask = mbr.bits(7);
 		for (let idx = 0; idx < 7; idx++) {
 			if (mask & (1 << idx)) {
-				mbr.number();
+				registers[idx] = mbr.number() >>> 0;
 			}
 		}
 	}
-	// new program bytecode (only when the filter slot is empty).
+
 	if (prog === undefined) {
 		const len = mbr.number();
-		for (let idx = 0; idx < len; idx++) {
-			mbr.bits(8);
+		if (len === 0 || len > 0x10000) {
+			throw new Error(`rar3 filter bytecode length ${len} out of range`);
 		}
-		decoder.programs[progIndex] = { oldFilterLength: 0, usageCount: 1 };
+		const bytecode = new Uint8Array(len);
+		for (let idx = 0; idx < len; idx++) {
+			bytecode[idx] = mbr.bits(8);
+		}
+		// the bytecode carries an XOR checksum in byte 0; libarchive uses it
+		// to reject corrupted programs before computing the fingerprint.
+		let xor = 0;
+		for (let idx = 1; idx < len; idx++) {
+			xor ^= bytecode[idx];
+		}
+		if (xor !== bytecode[0]) {
+			throw new Error('rar3 filter bytecode XOR checksum mismatch');
+		}
+		prog = { kind: fingerprint(bytecode), oldFilterLength: 0, usageCount: 1 };
+		state.programs[progIndex] = prog;
 	} else {
 		prog.usageCount++;
 	}
-	// optional global-data overlay.
+	prog.oldFilterLength = blockLength;
+
+	// optional global-data overlay. the standard filters don't consult it, so
+	// we just walk past the bits to keep the MemoryBitReader in sync.
 	if (flags & 0x08) {
 		const len = mbr.number();
 		for (let idx = 0; idx < len; idx++) {
 			mbr.bits(8);
 		}
 	}
+
+	state.stack.push({ blockLength, blockStart, prog, registers });
 };
 
-// the slice of decoder state that {@link skipFilterCommand} mutates.
-interface Rar3DecoderState {
-	programs: (FilterProgram | undefined)[];
-	lastFilterNum: number;
-}
+// transforms one filter's input bytes (`source`, taken from the window) into
+// the post-filter output. the standard executors are translated from
+// libarchive's `execute_filter_*` helpers.
+//
+// `entryPos` is the entry-relative offset where the filter's range begins; the
+// e8/e8e9 filter uses it as the base for its absolute-address rewrites, while
+// the others ignore it.
+const runFilter = (filter: PendingFilter, source: Uint8Array, entryPos: number): Uint8Array => {
+	const { blockLength, prog, registers } = filter;
+
+	switch (prog.kind) {
+		case FilterKind.Delta: {
+			const channels = registers[0];
+			if (channels === 0) {
+				throw new Error('rar3 delta filter with zero channels');
+			}
+			const result = new Uint8Array(blockLength);
+			let srcIdx = 0;
+			for (let ch = 0; ch < channels; ch++) {
+				let prev = 0;
+				for (let dst = ch; dst < blockLength; dst += channels) {
+					prev = (prev - source[srcIdx++]) & 0xff;
+					result[dst] = prev;
+				}
+			}
+			return result;
+		}
+		case FilterKind.E8:
+		case FilterKind.E8E9: {
+			const e9also = prog.kind === FilterKind.E8E9;
+			const fileSize = 0x1000000;
+			const out = new Uint8Array(blockLength);
+			out.set(source.subarray(0, blockLength));
+			if (blockLength <= 4) {
+				return out;
+			}
+			for (let i = 0; i + 5 <= blockLength;) {
+				const op = out[i];
+				if (op === 0xe8 || (e9also && op === 0xe9)) {
+					const currpos = (entryPos + i + 1) >>> 0;
+					const address = readLe32(out, i + 1) | 0;
+					if (address < 0 && currpos >= (-address >>> 0)) {
+						writeLe32(out, i + 1, (address + fileSize) >>> 0);
+					} else if (address >= 0 && address < fileSize) {
+						writeLe32(out, i + 1, (address - currpos) >>> 0);
+					}
+					i += 5;
+				} else {
+					i++;
+				}
+			}
+			return out;
+		}
+		case FilterKind.Rgb: {
+			const stride = registers[0];
+			const byteOffset = registers[1];
+			if (stride === 0 || stride > blockLength || blockLength < 3 || byteOffset > 2) {
+				throw new Error('rar3 rgb filter parameters invalid');
+			}
+			const result = new Uint8Array(blockLength);
+			let src = 0;
+			for (let i = 0; i < 3; i++) {
+				let byte = 0;
+				// `prev` walks the previous scanline; it starts negative for the
+				// first row (no prior data) and the predictor falls through.
+				let prev = i - stride;
+				for (let j = i; j < blockLength; j += 3) {
+					if (prev >= 0 && prev + 3 < blockLength) {
+						const a = result[prev + 3];
+						const b = result[prev];
+						const delta1 = Math.abs(a - b);
+						const delta2 = Math.abs(byte - b);
+						const delta3 = Math.abs(a - b + byte - b);
+						if (delta1 > delta2 || delta1 > delta3) {
+							byte = delta2 <= delta3 ? a : b;
+						}
+					}
+					byte = (byte - source[src++]) & 0xff;
+					result[j] = byte;
+					prev += 3;
+				}
+			}
+			for (let i = byteOffset; i + 2 < blockLength; i += 3) {
+				result[i] = (result[i] + result[i + 1]) & 0xff;
+				result[i + 2] = (result[i + 2] + result[i + 1]) & 0xff;
+			}
+			return result;
+		}
+		case FilterKind.Audio: {
+			const channels = registers[0];
+			if (channels === 0) {
+				throw new Error('rar3 audio filter with zero channels');
+			}
+			const result = new Uint8Array(blockLength);
+			let src = 0;
+			for (let ch = 0; ch < channels; ch++) {
+				const error = [0, 0, 0, 0, 0, 0, 0];
+				const weight = [0, 0, 0];
+				const delta = [0, 0, 0];
+				let lastByte = 0;
+				let lastDelta = 0;
+				let count = 0;
+				for (let j = ch; j < blockLength; j += channels) {
+					const deltaIn = (source[src++] << 24) >> 24; // int8
+					delta[2] = delta[1];
+					delta[1] = lastDelta - delta[0];
+					delta[0] = lastDelta;
+					const predicted = ((8 * lastByte +
+						weight[0] * delta[0] +
+						weight[1] * delta[1] +
+						weight[2] * delta[2]) >> 3) & 0xff;
+					const byte = (predicted - deltaIn) & 0xff;
+					const predError = deltaIn << 3;
+					error[0] += Math.abs(predError);
+					error[1] += Math.abs(predError - delta[0]);
+					error[2] += Math.abs(predError + delta[0]);
+					error[3] += Math.abs(predError - delta[1]);
+					error[4] += Math.abs(predError + delta[1]);
+					error[5] += Math.abs(predError - delta[2]);
+					error[6] += Math.abs(predError + delta[2]);
+					lastDelta = (byte - lastByte) << 24 >> 24; // int8 wrap
+					lastByte = byte;
+					result[j] = byte;
+					if ((count++ & 0x1f) === 0) {
+						let idx = 0;
+						for (let k = 1; k < 7; k++) {
+							if (error[k] < error[idx]) {
+								idx = k;
+							}
+						}
+						error.fill(0);
+						switch (idx) {
+							case 1:
+								if (weight[0] >= -16) weight[0]--;
+								break;
+							case 2:
+								if (weight[0] < 16) weight[0]++;
+								break;
+							case 3:
+								if (weight[1] >= -16) weight[1]--;
+								break;
+							case 4:
+								if (weight[1] < 16) weight[1]++;
+								break;
+							case 5:
+								if (weight[2] >= -16) weight[2]--;
+								break;
+							case 6:
+								if (weight[2] < 16) weight[2]++;
+								break;
+						}
+					}
+				}
+			}
+			return result;
+		}
+		case FilterKind.Unknown: {
+			throw new Error('rar3 filter program is not one of the standard set');
+		}
+	}
+};
 
 // #endregion
 
@@ -689,12 +958,14 @@ export type DecodeSink = (chunk: Uint8Array<ArrayBuffer>) => void | Promise<void
  * a stateful RAR3 LZSS decoder.
  *
  * one instance carries the sliding window, repeat-distance cache, last match
- * length, last low-offset, Huffman length table and tables themselves, plus
- * the bit reader across calls. consecutive {@link Rar3Decoder.decode} calls
- * represent the entries of a solid run sharing one state.
+ * length, last low-offset, Huffman length table and tables themselves, the bit
+ * reader, and the VM filter list across calls. consecutive
+ * {@link Rar3Decoder.decode} calls represent the entries of a solid run
+ * sharing one state.
  *
- * VM filters are not yet supported; encountering symbol 257 in the LZSS
- * stream raises an error.
+ * filter execution covers the standard WinRAR programs (e8, e8e9, delta, rgb,
+ * audio); archives carrying a custom bytecode raise an "unknown filter
+ * program" error when the filter would execute.
  */
 export class Rar3Decoder {
 	readonly #windowSize: number;
@@ -716,21 +987,14 @@ export class Rar3Decoder {
 	#tables?: Tables;
 	/** set when the previous entry left a `start new table` marker in flight. */
 	#startNewTable = true;
-	/** set when a filter command was seen during the most recent decode. */
-	#sawFilter = false;
-	/** filter program list referenced by the next filter command. */
-	readonly #filterState: Rar3DecoderState = { lastFilterNum: 0, programs: [] };
-
+	/** filter program list and pending filter queue, shared across the solid run. */
+	readonly #filterState: Rar3DecoderState = { lastFilterNum: 0, programs: [], stack: [] };
 	/**
-	 * whether the most recent {@link decode} call passed through at least one
-	 * VM filter command. the LZSS stream stayed in sync, but the bytes inside
-	 * each filter's range are pre-filter and may differ from the original
-	 * plaintext. consumers that care about byte-exact output should treat a
-	 * `true` return as "content is not fully decoded".
+	 * filters whose range is fully written and whose post-filter bytes are
+	 * computed, waiting to be overlaid on top of the emit chunks they cover.
+	 * keyed by the filter's `blockStart` in write-pointer coordinates.
 	 */
-	get sawFilter(): boolean {
-		return this.#sawFilter;
-	}
+	readonly #ready = new Map<number, Uint8Array>();
 
 	/**
 	 * @param dictionarySize the dictionary size declared by the file header.
@@ -755,21 +1019,21 @@ export class Rar3Decoder {
 	 * shared window and emitting decoded chunks to `sink` as they settle.
 	 *
 	 * compressed bytes are pulled from `input` in 64 KiB blocks. across a
-	 * solid run, the Huffman tables and distance cache carry over so the next
-	 * entry's first symbols can reference them.
+	 * solid run, the Huffman tables, distance cache, and pending filter list
+	 * carry over so the next entry's first symbols can reference them.
 	 *
-	 * filter commands (symbol 257) are read off the bit stream so the LZSS
-	 * engine stays in sync, but the VM that would execute them is not yet
-	 * built — the bytes inside each filter's range come out pre-filter. check
-	 * {@link sawFilter} after a call to see whether any range is so affected.
+	 * filter commands (symbol 257) are parsed, their programs are fingerprinted
+	 * against the standard WinRAR filter set, and they execute when their range
+	 * is fully written — the resulting post-filter bytes overlay the raw LZ
+	 * output before reaching the sink.
 	 *
 	 * @param input compressed bytes of the entry's data area, in order
 	 * @param unpackedSize the expected uncompressed size
 	 * @param sink receives each decoded chunk in order
-	 * @throws if the stream is invalid or requests PPMd
+	 * @throws if the stream is invalid, requests PPMd, or carries a filter
+	 * program outside the standard set
 	 */
 	async decode(input: StreamReader, unpackedSize: number, sink: DecodeSink): Promise<void> {
-		this.#sawFilter = false;
 		const mask = this.#windowMask;
 		const window = this.#window;
 		const windowSize = this.#windowSize;
@@ -784,22 +1048,93 @@ export class Rar3Decoder {
 
 		let emitted = startWrite;
 
+		// for any pending filter whose range is now complete, stage the source
+		// bytes from the window and run the filter (chaining when consecutive
+		// filters share the same blockStart/blockLength). filtered bytes land
+		// in `#ready` keyed by blockStart so the next emit can overlay them.
+		const tryRunFilters = (): void => {
+			const stillPending: PendingFilter[] = [];
+			let lastFiltered: Uint8Array | undefined;
+			let lastBlockStart = -1;
+			let lastBlockLength = -1;
+			for (const f of this.#filterState.stack) {
+				const end = f.blockStart + f.blockLength;
+				if (this.#write < end) {
+					stillPending.push(f);
+					continue;
+				}
+				if (f.blockStart < emitted) {
+					throw new Error('rar3 filter range begins before already-emitted bytes');
+				}
+				let source: Uint8Array;
+				if (
+					f.blockStart === lastBlockStart && f.blockLength === lastBlockLength &&
+					lastFiltered !== undefined
+				) {
+					// chained: same range as the previous filter, source is its output.
+					source = lastFiltered;
+				} else {
+					source = new Uint8Array(f.blockLength);
+					for (let i = 0; i < f.blockLength; i++) {
+						source[i] = window[(f.blockStart + i) & mask];
+					}
+				}
+				const entryPos = f.blockStart - startWrite;
+				const filtered = runFilter(f, source, entryPos);
+				this.#ready.set(f.blockStart, filtered);
+				lastFiltered = filtered;
+				lastBlockStart = f.blockStart;
+				lastBlockLength = f.blockLength;
+			}
+			this.#filterState.stack = stillPending;
+		};
+
 		// drain bytes from the window into one chunk and pass it to the sink.
 		// called periodically inside the loop so that the unflushed window slice
 		// never reaches `windowSize`, which would let later writes wrap over
-		// and overwrite bytes the sink has not yet received.
-		const flush = async (): Promise<void> => {
-			const end = Math.min(this.#write, targetWrite);
-			if (end <= emitted) {
+		// and overwrite bytes the sink has not yet received. emission is
+		// bounded by the earliest still-pending filter's start, and ready
+		// filters' post-filter bytes overlay the chunk in place.
+		const flush = async (final: boolean): Promise<void> => {
+			tryRunFilters();
+
+			let safeEnd = final ? targetWrite : Math.min(this.#write, targetWrite);
+			for (const f of this.#filterState.stack) {
+				if (f.blockStart < safeEnd) {
+					safeEnd = f.blockStart;
+				}
+			}
+			if (safeEnd <= emitted) {
 				return;
 			}
-			const size = end - emitted;
+
+			const size = safeEnd - emitted;
 			const chunk = new Uint8Array(size);
 			for (let idx = 0; idx < size; idx++) {
 				chunk[idx] = window[(emitted + idx) & mask];
 			}
+
+			// overlay ready filters whose range intersects the chunk. any
+			// portion that tails past `safeEnd` stays in `#ready` for the
+			// next emit cycle.
+			for (const [fs, filtered] of this.#ready) {
+				const fe = fs + filtered.length;
+				const overlayStart = Math.max(fs, emitted);
+				const overlayEnd = Math.min(fe, safeEnd);
+				if (overlayEnd <= overlayStart) {
+					continue;
+				}
+				chunk.set(
+					filtered.subarray(overlayStart - fs, overlayEnd - fs),
+					overlayStart - emitted,
+				);
+				if (overlayEnd >= fe) {
+					this.#ready.delete(fs);
+				}
+			}
+
 			await sink(chunk);
-			emitted = end;
+			emitted = safeEnd;
 		};
 
 		// pulls a contiguous slab of compressed bytes large enough that the
@@ -812,17 +1147,18 @@ export class Rar3Decoder {
 		let bits: BitReader | undefined;
 
 		// grows the bit reader's backing buffer until it has at least `count`
-		// bytes available past the current position (plus PAD). returns false
-		// when the source is exhausted before the requested cushion is met;
-		// the caller treats that as "no more input" rather than an error so
-		// the entry's completion can still be validated against expected size.
+		// bytes available past the current position (plus PAD). when the
+		// source is exhausted but the bit reader still has unread bytes,
+		// returns true — peek16/peek32 stay safe thanks to the PAD cushion
+		// and the encoder's last symbols sit at the tail of the real data.
+		// only returns false once the bit reader has nothing usable left.
 		const ensureBytes = async (count: number): Promise<boolean> => {
 			while (bits === undefined || bits.addr + count > bits.data.length - PAD) {
 				if (input.buffered === 0) {
 					try {
 						await input.require(1);
 					} catch {
-						return false;
+						return bits !== undefined && bits.addr + 5 <= bits.data.length;
 					}
 				}
 				const take = Math.min(input.buffered, BLOCK_SIZE);
@@ -890,7 +1226,7 @@ export class Rar3Decoder {
 			// iteration's copy can't overwrite bytes that haven't reached the
 			// sink. for a small entry this typically only runs at the end.
 			if (this.#write - emitted >= FLUSH_HIGH_WATER) {
-				await flush();
+				await flush(false);
 			}
 
 			if (!await ensureBytes(16)) {
@@ -930,12 +1266,17 @@ export class Rar3Decoder {
 			}
 
 			if (symbol === 257) {
-				// consume the filter command from the bit stream so the LZSS
-				// engine stays in sync, but mark the entry as filter-tainted so
-				// the caller knows the output bytes inside filter ranges are
-				// pre-filter (i.e. not the original plaintext).
-				await skipFilterCommand(bits!, this.#filterState, ensureBytesOrThrow);
-				this.#sawFilter = true;
+				// parse the filter command off the bit stream and stage it on
+				// the decoder's filter stack; the queued filter will execute
+				// when the LZSS engine has produced enough output to cover
+				// its `[blockStart, blockStart + blockLength)` range.
+				await parseFilterCommand(
+					bits!,
+					this.#filterState,
+					this.#write,
+					windowSize,
+					ensureBytesOrThrow,
+				);
 				continue;
 			}
 
@@ -1033,11 +1374,16 @@ export class Rar3Decoder {
 			copy(len, offs);
 		}
 
-		await flush();
+		await flush(true);
 
 		if (this.#write < targetWrite) {
 			throw new Error(
 				`rar3 decompressed ${this.#write - startWrite} bytes, expected ${unpackedSize}`,
+			);
+		}
+		if (emitted < targetWrite) {
+			throw new Error(
+				`rar3 pending filter prevents final emission past byte ${emitted - startWrite}`,
 			);
 		}
 	}

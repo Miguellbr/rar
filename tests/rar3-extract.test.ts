@@ -22,7 +22,6 @@ const PER_FILE_SKIP = new Set([
 	'rar3-old.r00',
 	'rar3-old.r01',
 	'rar3-old.rar',
-	'rar3-solid.rar',
 	'rar3-vols.part1.rar',
 	'rar3-vols.part2.rar',
 	'rar3-vols.part3.rar',
@@ -189,10 +188,6 @@ Deno.test('rar3 extract: rar3-vols rejects a standalone middle volume', async ()
 
 Deno.test({
 	name: 'rar3 extract: seektest stest1 (compressed) matches stest2 (stored)',
-	// the encoder runs an x86 filter (symbol 257) even on plain ASCII as a
-	// "just in case" pass; until the RAR3 VM lands the compressed body
-	// cannot be reconstructed. re-enable once filters are implemented.
-	ignore: true,
 	fn: async () => {
 		const data = Deno.readFileSync(new URL('seektest.rar', FIXTURES_DIR));
 		const reader = fromUint8Array(data);
