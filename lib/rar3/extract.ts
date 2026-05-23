@@ -1,4 +1,5 @@
-import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
+import { concat, decodeUtf8From } from '../utils/buffer.ts';
+import { type DataSegment, deferStream, readBytes, streamSegments } from '../utils/segments.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
 
 import type { Reader } from '../reader/types.ts';
@@ -27,87 +28,6 @@ const COMMON_HEADER_SIZE = 7;
 // COMMON_HEADER_SIZE plus the optional 4-byte add_size field that LONG_BLOCK
 // brings; never crosses past a real block's header.
 const HEADER_PROBE_SIZE = COMMON_HEADER_SIZE + 4;
-
-// reads exactly `length` bytes from `reader` at `offset`.
-const readBytes = async (
-	reader: Reader,
-	offset: number,
-	length: number,
-): Promise<Uint8Array<ArrayBuffer>> => {
-	return await read(await reader.read(offset, length), length);
-};
-
-// adapts a lazily-opened stream into one that can be returned synchronously.
-const deferStream = (
-	open: () => Promise<ReadableStream<Uint8Array>>,
-): ReadableStream<Uint8Array> => {
-	let inner: ReadableStreamDefaultReader<Uint8Array> | undefined;
-
-	return new ReadableStream({
-		async start(controller) {
-			try {
-				inner = (await open()).getReader();
-			} catch (error) {
-				controller.error(error);
-			}
-		},
-		async pull(controller) {
-			if (inner === undefined) {
-				controller.close();
-				return;
-			}
-			const { done, value } = await inner.read();
-			if (done) {
-				controller.close();
-			} else {
-				controller.enqueue(value);
-			}
-		},
-		async cancel() {
-			await inner?.cancel();
-		},
-	});
-};
-
-// a slice of an entry's data area within a single volume.
-interface DataSegment {
-	reader: Reader;
-	offset: number;
-	size: number;
-}
-
-// streams the bytes of every segment in order without buffering them all up.
-const streamSegments = (
-	segments: readonly DataSegment[],
-): ReadableStream<Uint8Array<ArrayBuffer>> => {
-	let index = 0;
-	let current: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>> | undefined;
-
-	return new ReadableStream({
-		async pull(controller) {
-			for (;;) {
-				if (current === undefined) {
-					if (index === segments.length) {
-						controller.close();
-						return;
-					}
-					const segment = segments[index++];
-					current = (await segment.reader.read(segment.offset, segment.size)).getReader();
-				}
-				const { done, value } = await current.read();
-				if (done) {
-					current = undefined;
-					continue;
-				}
-				controller.enqueue(value);
-				return;
-			}
-		},
-		async cancel() {
-			await current?.cancel();
-		},
-	});
-};
 
 // #endregion
 

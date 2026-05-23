@@ -1,6 +1,6 @@
 import { fromUint8Array } from '../lib/reader/common.ts';
 import { fromFsFile } from '../lib/reader/deno.ts';
-import { unrar } from '../lib/rar5/extract.ts';
+import { unrar5 } from '../lib/rar5/extract.ts';
 import { crc32 } from '../lib/utils/crc32.ts';
 
 /**
@@ -14,7 +14,7 @@ const FIXTURES_DIR = new URL('./fixtures/rarfile/files/', import.meta.url);
 
 // fixtures the per-file extractor pass cannot exercise: the misnamed RAR3
 // file and the multi-volume parts which only round-trip when handed to
-// unrar() together (covered separately below).
+// unrar5() together (covered separately below).
 const SKIP = new Set([
 	'rar5-readonly-win.rar',
 	'rar5-vols.part1.rar',
@@ -42,7 +42,7 @@ for (const name of fixtures) {
 			let entries = 0;
 			let verified = 0;
 
-			for await (const entry of unrar(reader, { password })) {
+			for await (const entry of unrar5(reader, { password })) {
 				entries++;
 
 				// directories and links are not yet read back; everything else,
@@ -91,7 +91,7 @@ Deno.test('rar5 extract: rar5-psw stored and compressed entries decrypt to the s
 	const reader = fromUint8Array(data);
 
 	const byName = new Map<string, Uint8Array>();
-	for await (const entry of unrar(reader, { password: CORPUS_PASSWORD })) {
+	for await (const entry of unrar5(reader, { password: CORPUS_PASSWORD })) {
 		byName.set(entry.filename, await entry.bytes());
 	}
 
@@ -116,7 +116,7 @@ Deno.test('rar5 extract: rar5-psw rejects a wrong password', async () => {
 
 	let threw = false;
 	try {
-		for await (const entry of unrar(reader, { password: 'wrong-password' })) {
+		for await (const entry of unrar5(reader, { password: 'wrong-password' })) {
 			await entry.bytes();
 		}
 	} catch (error) {
@@ -136,7 +136,7 @@ Deno.test('rar5 extract: rar5-psw rejects a missing password', async () => {
 
 	let threw = false;
 	try {
-		for await (const entry of unrar(reader)) {
+		for await (const entry of unrar5(reader)) {
 			await entry.bytes();
 		}
 	} catch (error) {
@@ -156,7 +156,7 @@ Deno.test('rar5 extract: rar5-vols multi-volume set', async () => {
 	);
 
 	const seen: { name: string; size: number; split: boolean }[] = [];
-	for await (const entry of unrar(readers)) {
+	for await (const entry of unrar5(readers)) {
 		const bytes = await entry.bytes();
 
 		if (bytes.length !== entry.size) {
@@ -185,7 +185,7 @@ Deno.test('rar5 extract: rar5-vols rejects a standalone middle volume', async ()
 
 	let threw = false;
 	try {
-		for await (const _ of unrar(reader)) {
+		for await (const _ of unrar5(reader)) {
 			// the first file block in part2 has splitBefore set with no preceding head
 		}
 	} catch (error) {
@@ -204,7 +204,7 @@ Deno.test('rar5 extract: stored content round-trips', async () => {
 	const data = Deno.readFileSync(new URL('rar5-subdirs.rar', FIXTURES_DIR));
 
 	const byName = new Map<string, string>();
-	for await (const entry of unrar(fromUint8Array(data))) {
+	for await (const entry of unrar5(fromUint8Array(data))) {
 		if (!entry.isDirectory) {
 			byName.set(entry.filename, await entry.text());
 		}
@@ -236,7 +236,7 @@ Deno.test({
 		try {
 			let bodyConsumed = false;
 
-			for await (const entry of unrar(readers)) {
+			for await (const entry of unrar5(readers)) {
 				if (entry.filename !== 'vols/bigfile.txt') {
 					await entry.bytes();
 					continue;

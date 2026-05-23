@@ -1,5 +1,6 @@
-import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
+import { concat, decodeUtf8From } from '../utils/buffer.ts';
 import { crc32 } from '../utils/crc32.ts';
+import { type DataSegment, deferStream, readBytes, streamSegments } from '../utils/segments.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
 
 import type { Reader } from '../reader/types.ts';
@@ -13,130 +14,11 @@ import { Rar5Decoder } from './unpack.ts';
 /**
  * @module
  *
- * sequential extraction of RAR5 archives. {@link unrar} walks an archive's
- * block headers and yields a {@link RarEntry} for each file it contains, and
+ * sequential extraction of RAR5 archives. {@link unrar5} walks an archive's
+ * block headers and yields a {@link Rar5Entry} for each file it contains, and
  * for multi-volume archives stitches a file's data segments across volumes
  * into a single logical entry.
  */
-
-// reads exactly `length` bytes from the reader at `offset`.
-const readBytes = async (
-	reader: Reader,
-	offset: number,
-	length: number,
-): Promise<Uint8Array<ArrayBuffer>> => {
-	return await read(await reader.read(offset, length), length);
-};
-
-// adapts a lazily-opened stream into one that can be returned synchronously.
-// the cancellation flag handles the race where cancel() arrives before
-// open() resolves: without it, the freshly-opened inner stream would be
-// assigned onto an already-cancelled outer stream and leak its reader.
-const deferStream = (
-	open: () => Promise<ReadableStream<Uint8Array>>,
-): ReadableStream<Uint8Array> => {
-	let inner: ReadableStreamDefaultReader<Uint8Array> | undefined;
-	let cancelled = false;
-	let cancelReason: unknown;
-
-	return new ReadableStream({
-		async start(controller) {
-			try {
-				const stream = await open();
-				if (cancelled) {
-					await stream.cancel(cancelReason);
-					return;
-				}
-				inner = stream.getReader();
-			} catch (error) {
-				controller.error(error);
-			}
-		},
-		async pull(controller) {
-			if (inner === undefined) {
-				controller.close();
-				return;
-			}
-
-			const { done, value } = await inner.read();
-			if (done) {
-				controller.close();
-			} else {
-				controller.enqueue(value);
-			}
-		},
-		async cancel(reason) {
-			cancelled = true;
-			cancelReason = reason;
-			await inner?.cancel(reason);
-		},
-	});
-};
-
-// a slice of an entry's data area within a single volume.
-interface DataSegment {
-	reader: Reader;
-	offset: number;
-	size: number;
-}
-
-// pulls the bytes of every segment through one ReadableStream, in order, so
-// the decoder (or AES-CBC decrypt stream) can read an entry's data area
-// without ever buffering the whole payload in memory.
-const streamSegments = (segments: DataSegment[]): ReadableStream<Uint8Array<ArrayBuffer>> => {
-	let index = 0;
-	let current: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>> | undefined;
-	let cancelled = false;
-	let cancelReason: unknown;
-
-	return new ReadableStream({
-		async pull(controller) {
-			for (;;) {
-				if (cancelled) {
-					controller.close();
-					return;
-				}
-				if (current === undefined) {
-					// zero-length segments cannot be opened through some readers
-					// (e.g. fromFetch builds a malformed `bytes=N--1` Range
-					// header when length is 0); skip them entirely.
-					while (index < segments.length && segments[index].size === 0) {
-						index++;
-					}
-					if (index === segments.length) {
-						controller.close();
-						return;
-					}
-
-					const segment = segments[index++];
-					const stream = await segment.reader.read(segment.offset, segment.size);
-					if (cancelled) {
-						// cancel arrived while we were awaiting the segment; release
-						// the freshly-opened stream rather than orphaning it.
-						await stream.cancel(cancelReason);
-						controller.close();
-						return;
-					}
-					current = stream.getReader();
-				}
-
-				const { done, value } = await current.read();
-				if (done) {
-					current = undefined;
-					continue;
-				}
-
-				controller.enqueue(value);
-				return;
-			}
-		},
-		async cancel(reason) {
-			cancelled = true;
-			cancelReason = reason;
-			await current?.cancel(reason);
-		},
-	});
-};
 
 // wraps `source` in a stream that accumulates a CRC32 over every emitted byte
 // and surfaces a `crc32 mismatch` (or size-mismatch) error on clean close.
@@ -367,14 +249,14 @@ export const walkArchive = (
  * a single file entry within a RAR5 archive.
  *
  * metadata is available immediately; the entry's content is read lazily from
- * the archive when {@link RarEntry.body} or one of the convenience readers is
+ * the archive when {@link Rar5Entry.body} or one of the convenience readers is
  * accessed. an entry that belongs to a solid run shares its decompression
  * state with the entries preceding it, and an entry whose data is split
- * across volumes spans multiple readers internally; the {@link unrar}
+ * across volumes spans multiple readers internally; the {@link unrar5}
  * iterator drives both kinds of coordination so callers can simply consume
  * entries in order.
  */
-export class RarEntry {
+export class Rar5Entry {
 	readonly #head: FileBlock;
 	readonly #segments: DataSegment[];
 	readonly #finalCrc: number | undefined;
@@ -743,7 +625,7 @@ export class RarEntry {
 	}
 }
 
-/** options controlling how {@link unrar} reads an archive. */
+/** options controlling how {@link unrar5} reads an archive. */
 export interface UnrarOptions {
 	/**
 	 * the password used to decrypt entries with encrypted data. password
@@ -773,15 +655,15 @@ export interface UnrarOptions {
  * @throws if a volume is not a RAR5 archive, a header fails validation, or a
  * split file's continuation is missing
  */
-export async function* unrar(
+export async function* unrar5(
 	source: Reader | readonly Reader[],
 	options?: UnrarOptions,
-): AsyncGenerator<RarEntry> {
+): AsyncGenerator<Rar5Entry> {
 	const readers: readonly Reader[] = Array.isArray(source) ? source : [source];
 	const keys = options?.password !== undefined ? new KeyCache(options.password) : undefined;
 
 	let decoder: Rar5Decoder | undefined;
-	let pending: RarEntry | undefined;
+	let pending: Rar5Entry | undefined;
 
 	let openHead: FileBlock | undefined;
 	let openSegments: DataSegment[] = [];
@@ -832,27 +714,27 @@ export async function* unrar(
 		const solid = (head.compressionInfo & COMPRESSION_SOLID) !== 0;
 		const dictExp = (head.compressionInfo >> 10) & 0x0f;
 
-		let entry: RarEntry;
+		let entry: Rar5Entry;
 
 		if (method === 0) {
 			// a stored entry is independent of any solid run; reading it does not
 			// touch the decoder's state.
-			entry = new RarEntry(head, segments, finalCrc, undefined, keys);
+			entry = new Rar5Entry(head, segments, finalCrc, undefined, keys);
 		} else if (!solid) {
 			// the head of a (potentially solid) run gets a fresh decoder.
 			decoder = new Rar5Decoder(dictExp);
-			entry = new RarEntry(head, segments, finalCrc, decoder, keys);
+			entry = new Rar5Entry(head, segments, finalCrc, decoder, keys);
 		} else if (decoder !== undefined) {
 			// a continuation of the current solid run; the previous entry must
 			// finish decoding so the shared window is in the right state.
 			if (pending !== undefined) {
 				await pending._drain();
 			}
-			entry = new RarEntry(head, segments, finalCrc, decoder, keys);
+			entry = new Rar5Entry(head, segments, finalCrc, decoder, keys);
 		} else {
 			// a solid entry without a preceding run head; surface as an error at
 			// read time rather than silently producing wrong bytes.
-			entry = new RarEntry(head, segments, finalCrc, undefined, keys);
+			entry = new Rar5Entry(head, segments, finalCrc, undefined, keys);
 		}
 
 		pending = entry;
