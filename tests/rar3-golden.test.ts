@@ -21,12 +21,16 @@ const SKIP: Record<string, string> = {
 	'rar3-comment-hpsw.rar': 'encrypted headers; needs RAR3 header decryption',
 	'rar3-comment-plain.rar': 'archive- and entry-level comments; sub-block dump not yet rendered',
 	'rar3-comment-psw.rar': 'encrypted comment; sub-block dump not yet rendered',
-	'rar3-old.r00': 'multi-volume continuation; aggregation not yet implemented',
-	'rar3-old.r01': 'multi-volume continuation; aggregation not yet implemented',
-	'rar3-old.rar': 'multi-volume head; aggregation not yet implemented',
-	'rar3-vols.part1.rar': 'multi-volume; aggregation not yet implemented',
-	'rar3-vols.part2.rar': 'multi-volume continuation; aggregation not yet implemented',
-	'rar3-vols.part3.rar': 'multi-volume continuation; aggregation not yet implemented',
+	'rar3-old.r00': 'no golden file; rendered through rar3-old.rar as its first volume',
+	'rar3-old.r01': 'no golden file; rendered through rar3-old.rar as its first volume',
+};
+
+// multi-volume sets identified by the first-volume filename. each entry names
+// every continuation volume in archive order; the dumper aggregates split
+// files across the whole list when given the first volume.
+const VOLUME_SETS: Record<string, readonly string[]> = {
+	'rar3-old.rar': ['rar3-old.r00', 'rar3-old.r01'],
+	'rar3-vols.part1.rar': ['rar3-vols.part2.rar', 'rar3-vols.part3.rar'],
 };
 
 const describeDiff = (actual: string, expected: string): string => {
@@ -56,10 +60,20 @@ for (const name of fixtures) {
 		name: `rar3 golden dump: ${name}`,
 		ignore: skipReason !== undefined,
 		fn: () => {
-			const data = Deno.readFileSync(new URL(name, FIXTURES_DIR));
+			const continuations = VOLUME_SETS[name];
 			const expected = Deno.readTextFileSync(new URL(`${name}.exp`, FIXTURES_DIR));
 
-			const actual = dumpArchive(data, `test/files/${name}`);
+			let actual: string;
+			if (continuations === undefined) {
+				const data = Deno.readFileSync(new URL(name, FIXTURES_DIR));
+				actual = dumpArchive(data, `test/files/${name}`);
+			} else {
+				const volumes = [
+					Deno.readFileSync(new URL(name, FIXTURES_DIR)),
+					...continuations.map((vol) => Deno.readFileSync(new URL(vol, FIXTURES_DIR))),
+				];
+				actual = dumpArchive(volumes, `test/files/${name}`);
+			}
 
 			if (actual !== expected) {
 				throw new Error(`golden dump mismatch for ${name}\n${describeDiff(actual, expected)}`);

@@ -13,9 +13,9 @@
  * encrypted-header variants are not yet rendered.
  */
 
-import type { DosTime, ExtTime, FileBlock } from './block.ts';
+import type { DosTime, EndArcBlock, ExtTime, FileBlock, MainBlock } from './block.ts';
 import { walkBlocks } from './block.ts';
-import { FileFlag, HostOs } from './constants.ts';
+import { EndArcFlag, FileFlag, HostOs, MainFlag } from './constants.ts';
 
 // #region flag rendering
 
@@ -214,90 +214,193 @@ const normalizeName = (name: string): string => name.replaceAll('\\', '/');
 
 // #region archive dump
 
-const dumpFile = (block: FileBlock, lines: string[]): void => {
-	const dir = isDirectory(block);
-	const link = isSymlink(block);
+// the per-file dump state carried across a multi-volume walk: the head's
+// metadata lives in `head`, while the volume index and split-aware totals
+// settle as later parts are seen.
+interface AggregatedFile {
+	head: FileBlock;
+	compressedSize: number;
+	crc: number;
+	volume: number;
+}
+
+const dumpFile = (entry: AggregatedFile, lines: string[]): void => {
+	const { compressedSize, crc, head, volume } = entry;
+	const dir = isDirectory(head);
+	const link = isSymlink(head);
 	// rarfile prints `is=` as three characters: file, dir, link. unix
 	// symlinks are detected through the host-mode S_IFLNK bits.
 	const rftype = (link || dir ? '-' : 'F') + (dir ? 'D' : '-') + (link ? 'L' : '-');
 
-	lines.push(`FILE: hdrlen=${block.headerSize} datlen=${block.dataSize} is=${rftype}`);
+	lines.push(`FILE: hdrlen=${head.headerSize} datlen=${head.dataSize} is=${rftype}`);
 	lines.push(
-		`  flags=0x${block.fileFlags.toString(16).padStart(4, '0')}:` +
-			renderFileFlags(block.fileFlags),
+		`  flags=0x${head.fileFlags.toString(16).padStart(4, '0')}:` +
+			renderFileFlags(head.fileFlags),
 	);
 
-	const osName = OS_NAMES[block.hostOs] ?? `OS${block.hostOs}`;
-	const methodDigit = block.method >= 0x30 && block.method <= 0x35 ? block.method - 0x30 : block.method;
+	const osName = OS_NAMES[head.hostOs] ?? `OS${head.hostOs}`;
+	const methodDigit = head.method >= 0x30 && head.method <= 0x35 ? head.method - 0x30 : head.method;
 
 	// dumprar adds `namecmp=N/M` for unicode names: N is the size of the
 	// base bytes the name decodes from (everything before the optional NUL
 	// in the raw name field), M is the on-disk name field length.
 	let nameCmp = '';
-	if ((block.fileFlags & FileFlag.unicode) !== 0) {
-		const nul = block.rawName.indexOf(0);
-		const baseLen = nul === -1 ? block.rawName.length : nul;
-		nameCmp = ` namecmp=${baseLen}/${block.rawName.length}`;
+	if ((head.fileFlags & FileFlag.unicode) !== 0) {
+		const nul = head.rawName.indexOf(0);
+		const baseLen = nul === -1 ? head.rawName.length : nul;
+		nameCmp = ` namecmp=${baseLen}/${head.rawName.length}`;
 	}
 
 	lines.push(
-		`  os=${block.hostOs}:${osName} ver=${block.extractVersion}` +
-			` mode=${renderMode(block.hostOs, block.attributes)}` +
+		`  os=${head.hostOs}:${osName} ver=${head.extractVersion}` +
+			` mode=${renderMode(head.hostOs, head.attributes)}` +
 			` meth=${methodDigit}` +
-			` cmp=${block.dataSize} dec=${block.unpackedSize} vol=0` +
+			` cmp=${compressedSize} dec=${head.unpackedSize} vol=${volume}` +
 			nameCmp,
 	);
 
 	// the extended-time record can bump the DOS mtime by 1 second so it
 	// recovers the resolution DOS truncates; the dump uses the corrected
 	// value for both the `date_time` and `mtime` lines.
-	const baseTime = block.extMtime?.time ?? block.mtime;
+	const baseTime = head.extMtime?.time ?? head.mtime;
 	lines.push(
-		`  crc=0x${block.crc.toString(16).padStart(8, '0')} (${block.crc})` +
+		`  crc=0x${crc.toString(16).padStart(8, '0')} (${crc})` +
 			` date_time=${formatDateTime(baseTime)}`,
 	);
-	lines.push(`  name=${normalizeName(block.name)}${dir ? '/' : ''}`);
-	if (block.extMtime !== undefined) {
-		lines.push(`  mtime=${formatExtTime(block.extMtime, baseTime)}`);
+	lines.push(`  name=${normalizeName(head.name)}${dir ? '/' : ''}`);
+	if (head.extMtime !== undefined) {
+		lines.push(`  mtime=${formatExtTime(head.extMtime, baseTime)}`);
 	}
-	if (block.ctime !== undefined) {
-		lines.push(`  ctime=${formatIso(block.ctime.time, block.ctime.nanos)}`);
+	if (head.ctime !== undefined) {
+		lines.push(`  ctime=${formatIso(head.ctime.time, head.ctime.nanos)}`);
 	}
-	if (block.atime !== undefined) {
-		lines.push(`  atime=${formatIso(block.atime.time, block.atime.nanos)}`);
+	if (head.atime !== undefined) {
+		lines.push(`  atime=${formatIso(head.atime.time, head.atime.nanos)}`);
 	}
-	if (block.arctime !== undefined) {
-		lines.push(`  arctime=${formatIso(block.arctime.time, block.arctime.nanos)}`);
+	if (head.arctime !== undefined) {
+		lines.push(`  arctime=${formatIso(head.arctime.time, head.arctime.nanos)}`);
 	}
+};
+
+// returns true when a single-volume buffer represents a continuation rather
+// than the first volume of a multi-volume set, matching rarfile's check.
+const isContinuationVolume = (main: MainBlock, firstFile: FileBlock | undefined): boolean => {
+	if ((main.mainFlags & MainFlag.newNumbering) !== 0) {
+		// modern .partN.rar volumes flag the first member with FIRSTVOLUME;
+		// anything else without that flag must be a continuation.
+		return (main.mainFlags & MainFlag.firstVolume) === 0;
+	}
+	// RAR1.5 - RAR2.x do not flag the first volume, so the only signal is that
+	// the very first file in the volume continues from a previous part.
+	return firstFile !== undefined && (firstFile.fileFlags & FileFlag.splitBefore) !== 0;
 };
 
 /**
  * dumps a RAR3 (RAR1.5 - RAR4) archive in dumprar's verbosity-1 format.
  *
- * superseded file versions, split continuations, and sub-records (CMT, RR,
- * etc.) are skipped to match how dumprar walks an archive's name list. only
- * file entries are dumped, in archive order. archive- and entry-level
- * comments, encrypted-header archives, and multi-volume aggregation are not
- * yet supported.
+ * pass a single buffer for a self-contained archive or an ordered list of
+ * volume buffers to aggregate a split set. only file entries are dumped, in
+ * archive order; superseded versions and the trailing parts of split files
+ * fold into their head per dumprar. archive- and entry-level comments and
+ * encrypted-header archives are not yet rendered.
  *
- * @param data the complete archive bytes
+ * a single buffer that is actually a middle or trailing volume produces
+ * dumprar's `--- ... is middle part of multi-vol archive` line so the test
+ * suite sees the same output as upstream.
+ *
+ * @param data the complete archive bytes for one volume, or an ordered list
+ * of every volume's bytes
  * @param archivePath path label to print on the leading `Archive:` line
  * @returns the dump text, newline-terminated
  */
-export const dumpArchive = (data: Uint8Array, archivePath: string): string => {
+export const dumpArchive = (
+	data: Uint8Array | readonly Uint8Array[],
+	archivePath: string,
+): string => {
+	const volumes: readonly Uint8Array[] = Array.isArray(data) ? data : [data as Uint8Array];
+	const isSingleVolume = !Array.isArray(data);
+
 	const lines: string[] = [`Archive: ${archivePath}`];
 
-	const files: FileBlock[] = [];
-	for (const block of walkBlocks(data)) {
-		if (block.kind === 'file') {
-			if ((block.fileFlags & FileFlag.version) !== 0) continue;
-			if ((block.fileFlags & FileFlag.splitBefore) !== 0) continue;
-			files.push(block);
+	// when only one volume is in hand, walk it once to find out whether it is
+	// the first or a continuation; if it is a continuation, surface the same
+	// error string dumprar prints and bail. the EndArc.volnr field (when
+	// present) names the volume's zero-based index for the error message.
+	if (isSingleVolume) {
+		let main: MainBlock | undefined;
+		let firstFile: FileBlock | undefined;
+		let endArc: EndArcBlock | undefined;
+		for (const block of walkBlocks(volumes[0])) {
+			if (block.kind === 'main' && main === undefined) {
+				main = block;
+			} else if (block.kind === 'file' && firstFile === undefined) {
+				firstFile = block;
+			} else if (block.kind === 'endArc') {
+				endArc = block;
+			}
+		}
+		if (main !== undefined && isContinuationVolume(main, firstFile)) {
+			let current: number | undefined;
+			if (endArc !== undefined && (endArc.endArcFlags & EndArcFlag.volNr) !== 0) {
+				current = endArc.volumeNumber;
+			}
+			const currentText = current !== undefined ? String(current) : '?';
+			lines.push(
+				` --- ${archivePath} is middle part of multi-vol archive` +
+					` (Need to start from first volume (current: ${currentText}))---`,
+			);
+			return lines.join('\n') + '\n';
 		}
 	}
 
-	for (const file of files) {
-		dumpFile(file, lines);
+	const entries: AggregatedFile[] = [];
+	const entriesByName = new Map<string, AggregatedFile>();
+	let openName: string | undefined;
+
+	for (let vol = 0; vol < volumes.length; vol++) {
+		for (const block of walkBlocks(volumes[vol])) {
+			if (block.kind !== 'file') {
+				continue;
+			}
+			if ((block.fileFlags & FileFlag.version) !== 0) {
+				continue;
+			}
+
+			const splitBefore = (block.fileFlags & FileFlag.splitBefore) !== 0;
+			const splitAfter = (block.fileFlags & FileFlag.splitAfter) !== 0;
+
+			if (!splitBefore) {
+				const entry: AggregatedFile = {
+					compressedSize: block.dataSize,
+					crc: block.crc,
+					head: block,
+					volume: vol,
+				};
+				entries.push(entry);
+				entriesByName.set(block.name, entry);
+				openName = splitAfter ? block.name : undefined;
+				continue;
+			}
+
+			// a continuation extends the open split entry; mirror dumprar's
+			// lenient skip when the names don't line up so a stray middle volume
+			// in a list doesn't blow up the dump.
+			if (openName === undefined || openName !== block.name) {
+				continue;
+			}
+			const entry = entriesByName.get(openName);
+			if (entry !== undefined) {
+				entry.compressedSize += block.dataSize;
+				entry.crc = block.crc;
+			}
+			if (!splitAfter) {
+				openName = undefined;
+			}
+		}
+	}
+
+	for (const entry of entries) {
+		dumpFile(entry, lines);
 	}
 
 	return lines.join('\n') + '\n';
