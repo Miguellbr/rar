@@ -345,7 +345,7 @@ const dumpFile = (entry: AggregatedFile, lines: string[]): void => {
 			`  algo=${enc.algorithm}:${algoName}` +
 				` enc_flags=${enc.flags.toString(16).padStart(4, '0')}:` +
 				renderFlags(enc.flags, ENCRYPTION_FLAG_BITS) +
-				` kdf_lg=${enc.kdfCount} kdf_count=${1 << enc.kdfCount}` +
+				` kdf_lg=${enc.kdfCount} kdf_count=${2 ** enc.kdfCount}` +
 				` salt=${enc.salt.toHex()} iv=${enc.iv.toHex()}` +
 				` checkval=${enc.checkValue !== undefined ? enc.checkValue.toHex() : '-'}`,
 		);
@@ -428,7 +428,11 @@ export const dumpArchive = async (
 			const method = (block.compressionInfo >> 7) & 0x07;
 
 			if (!split && method === 0) {
-				let cipherStream = await reader.read(block.dataOffset, block.dataSize);
+				// resolve any encryption parameters BEFORE opening the underlying
+				// reader's stream so an early `continue` (no password, unsupported
+				// algorithm) doesn't leak an unconsumed ReadableStream.
+				let aesKey: CryptoKey | undefined;
+				let aesIv: Uint8Array<ArrayBuffer> | undefined;
 				if (block.encryption !== undefined) {
 					if (keys === undefined) {
 						continue;
@@ -444,7 +448,12 @@ export const dumpArchive = async (
 					) {
 						verifyCheckValue(enc.checkValue, derived.checkValue);
 					}
-					cipherStream = decryptAesCbcStream(aes, enc.iv.slice(), cipherStream);
+					aesKey = aes;
+					aesIv = enc.iv.slice();
+				}
+				let cipherStream = await reader.read(block.dataOffset, block.dataSize);
+				if (aesKey !== undefined) {
+					cipherStream = decryptAesCbcStream(aesKey, aesIv!, cipherStream);
 				}
 				const raw = await read(cipherStream, block.dataSize);
 				// the comment is null-terminated within (possibly) CBC padding; cut
