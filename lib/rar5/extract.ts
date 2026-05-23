@@ -29,15 +29,25 @@ const readBytes = async (
 };
 
 // adapts a lazily-opened stream into one that can be returned synchronously.
+// the cancellation flag handles the race where cancel() arrives before
+// open() resolves: without it, the freshly-opened inner stream would be
+// assigned onto an already-cancelled outer stream and leak its reader.
 const deferStream = (
 	open: () => Promise<ReadableStream<Uint8Array>>,
 ): ReadableStream<Uint8Array> => {
 	let inner: ReadableStreamDefaultReader<Uint8Array> | undefined;
+	let cancelled = false;
+	let cancelReason: unknown;
 
 	return new ReadableStream({
 		async start(controller) {
 			try {
-				inner = (await open()).getReader();
+				const stream = await open();
+				if (cancelled) {
+					await stream.cancel(cancelReason);
+					return;
+				}
+				inner = stream.getReader();
 			} catch (error) {
 				controller.error(error);
 			}
@@ -55,8 +65,10 @@ const deferStream = (
 				controller.enqueue(value);
 			}
 		},
-		async cancel() {
-			await inner?.cancel();
+		async cancel(reason) {
+			cancelled = true;
+			cancelReason = reason;
+			await inner?.cancel(reason);
 		},
 	});
 };
@@ -74,18 +86,38 @@ interface DataSegment {
 const streamSegments = (segments: DataSegment[]): ReadableStream<Uint8Array<ArrayBuffer>> => {
 	let index = 0;
 	let current: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>> | undefined;
+	let cancelled = false;
+	let cancelReason: unknown;
 
 	return new ReadableStream({
 		async pull(controller) {
 			for (;;) {
+				if (cancelled) {
+					controller.close();
+					return;
+				}
 				if (current === undefined) {
+					// zero-length segments cannot be opened through some readers
+					// (e.g. fromFetch builds a malformed `bytes=N--1` Range
+					// header when length is 0); skip them entirely.
+					while (index < segments.length && segments[index].size === 0) {
+						index++;
+					}
 					if (index === segments.length) {
 						controller.close();
 						return;
 					}
 
 					const segment = segments[index++];
-					current = (await segment.reader.read(segment.offset, segment.size)).getReader();
+					const stream = await segment.reader.read(segment.offset, segment.size);
+					if (cancelled) {
+						// cancel arrived while we were awaiting the segment; release
+						// the freshly-opened stream rather than orphaning it.
+						await stream.cancel(cancelReason);
+						controller.close();
+						return;
+					}
+					current = stream.getReader();
 				}
 
 				const { done, value } = await current.read();
@@ -98,8 +130,77 @@ const streamSegments = (segments: DataSegment[]): ReadableStream<Uint8Array<Arra
 				return;
 			}
 		},
-		async cancel() {
-			await current?.cancel();
+		async cancel(reason) {
+			cancelled = true;
+			cancelReason = reason;
+			await current?.cancel(reason);
+		},
+	});
+};
+
+// wraps `source` in a stream that accumulates a CRC32 over every emitted byte
+// and surfaces a `crc32 mismatch` (or size-mismatch) error on clean close.
+// used by the body fast-path so a stored entry consumed via the streaming API
+// gets the same integrity guarantee as one read through bytes().
+const verifyingPassthrough = (
+	source: ReadableStream<Uint8Array<ArrayBuffer>>,
+	options: {
+		entryName: string;
+		expectedCrc: number | undefined;
+		expectedSize: number;
+	},
+): ReadableStream<Uint8Array<ArrayBuffer>> => {
+	if (options.expectedCrc === undefined) {
+		return source;
+	}
+	const { entryName, expectedCrc, expectedSize } = options;
+
+	let reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>> | undefined;
+	let computed = 0;
+	let received = 0;
+	let cancelled = false;
+
+	return new ReadableStream({
+		async pull(controller) {
+			if (reader === undefined) {
+				if (cancelled) {
+					controller.close();
+					return;
+				}
+				reader = source.getReader();
+			}
+
+			const { done, value } = await reader.read();
+			if (done) {
+				if (received !== expectedSize) {
+					controller.error(
+						new Error(
+							`${entryName}: stored data is ${received} bytes, expected ${expectedSize}`,
+						),
+					);
+					return;
+				}
+				if (computed !== expectedCrc) {
+					controller.error(
+						new Error(
+							`crc32 mismatch for ${entryName}: ` +
+								`stored 0x${expectedCrc.toString(16).padStart(8, '0')}, ` +
+								`computed 0x${computed.toString(16).padStart(8, '0')}`,
+						),
+					);
+					return;
+				}
+				controller.close();
+				return;
+			}
+
+			computed = crc32(value, computed);
+			received += value.length;
+			controller.enqueue(value);
+		},
+		async cancel(reason) {
+			cancelled = true;
+			await reader?.cancel(reason);
 		},
 	});
 };
@@ -550,12 +651,18 @@ export class RarEntry {
 	get body(): ReadableStream<Uint8Array> {
 		// an unencrypted stored entry can stream segment by segment without
 		// going through the decoder. once its chunks have been cached elsewhere
-		// (e.g. by bytes()), the cache path is cheaper.
+		// (e.g. by bytes()), the cache path is cheaper. the passthrough wraps
+		// the raw stream so the body call still verifies CRC32 — without it,
+		// silently-corrupted bytes would slip through while bytes() catches them.
 		if (
 			this.#decoder === undefined && this.#chunks === undefined &&
 			this.#head.encryption === undefined
 		) {
-			return streamSegments(this.#segments);
+			return verifyingPassthrough(streamSegments(this.#segments), {
+				entryName: this.#head.name,
+				expectedCrc: this.#finalCrc,
+				expectedSize: this.#head.unpackedSize,
+			});
 		}
 
 		return deferStream(async () => {
