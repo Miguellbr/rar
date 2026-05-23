@@ -335,7 +335,7 @@ export const dumpArchive = (
 				main = block;
 			} else if (block.kind === 'file' && firstFile === undefined) {
 				firstFile = block;
-			} else if (block.kind === 'endArc') {
+			} else if (block.kind === 'endArc' && endArc === undefined) {
 				endArc = block;
 			}
 		}
