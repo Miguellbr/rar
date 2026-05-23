@@ -1,9 +1,11 @@
 import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
+import { StreamReader } from '../utils/stream-reader.ts';
 
 import type { Reader } from '../reader/types.ts';
 import type { FileBlock, Rar3Block } from './block.ts';
 import { parseBlock } from './block.ts';
 import { CompressMethod, FileFlag, RAR3_SIGNATURE } from './constants.ts';
+import { Rar3Decoder } from './unpack.ts';
 
 /**
  * @module
@@ -13,9 +15,10 @@ import { CompressMethod, FileFlag, RAR3_SIGNATURE } from './constants.ts';
  * contains, stitching split entries across volumes when an ordered list of
  * readers is supplied.
  *
- * only stored entries (compression method 0x30) are currently extractable;
- * compressed methods are recognized but throw on read pending the RAR3
- * decompressor.
+ * stored entries (method 0x30) extract verbatim. compressed entries flow
+ * through the {@link Rar3Decoder} LZSS engine; the engine throws on PPMd
+ * blocks and on VM filter symbols, both of which are not yet supported.
+ * password-protected entries also throw at read time.
  */
 
 // #region helpers
@@ -201,14 +204,21 @@ export class Rar3Entry {
 	readonly #head: FileBlock;
 	readonly #segments: DataSegment[];
 	readonly #finalCrc: number;
+	readonly #decoder?: Rar3Decoder;
 
 	#chunks?: Promise<Uint8Array<ArrayBuffer>[]>;
 
 	/** @ignore */
-	constructor(head: FileBlock, segments: DataSegment[], finalCrc: number) {
+	constructor(
+		head: FileBlock,
+		segments: DataSegment[],
+		finalCrc: number,
+		decoder?: Rar3Decoder,
+	) {
 		this.#head = head;
 		this.#segments = segments;
 		this.#finalCrc = finalCrc;
+		this.#decoder = decoder;
 	}
 
 	/** the entry's path within the archive, with forward slashes as separators. */
@@ -298,29 +308,47 @@ export class Rar3Entry {
 				`cannot read ${this.filename}: rar3 password-protected entries are not yet supported`,
 			);
 		}
-		if (this.#head.method !== CompressMethod.stored) {
+
+		const expected = this.#head.unpackedSize;
+		const source = streamSegments(this.#segments);
+
+		if (this.#head.method === CompressMethod.stored) {
+			// stored: the concatenated segment bytes are the content verbatim.
+			const collected: Uint8Array<ArrayBuffer>[] = [];
+			let total = 0;
+			for await (const chunk of source) {
+				collected.push(chunk);
+				total += chunk.length;
+			}
+			if (total !== expected) {
+				throw new Error(
+					`stored data is ${total} bytes, expected ${expected}`,
+				);
+			}
+			return collected;
+		}
+
+		if (this.#decoder === undefined) {
 			throw new Error(
 				`cannot read ${this.filename}: rar3 compression method 0x${
 					this.#head.method.toString(16)
-				} is not yet supported`,
+				} requires a decoder that was not initialized for this entry`,
 			);
 		}
 
-		// stored: the concatenated segment bytes are the content verbatim.
-		const expected = this.#head.unpackedSize;
-		const source = streamSegments(this.#segments);
-		const collected: Uint8Array<ArrayBuffer>[] = [];
-		let total = 0;
-		for await (const chunk of source) {
-			collected.push(chunk);
-			total += chunk.length;
+		// compressed: hand the segments to the shared LZSS decoder. an empty
+		// expected size means nothing to do, but we still need to drain the
+		// stream so a later cached read does not see leftover bytes.
+		const chunks: Uint8Array<ArrayBuffer>[] = [];
+		if (expected === 0) {
+			return chunks;
 		}
-		if (total !== expected) {
-			throw new Error(
-				`stored data is ${total} bytes, expected ${expected}`,
-			);
-		}
-		return collected;
+
+		await using reader = new StreamReader(source);
+		await this.#decoder.decode(reader, expected, (chunk) => {
+			chunks.push(chunk);
+		});
+		return chunks;
 	}
 
 	/**
@@ -383,6 +411,18 @@ export class Rar3Entry {
 	async json(): Promise<unknown> {
 		return JSON.parse(await this.text());
 	}
+
+	/**
+	 * forces the entry's body to be decoded if it has not already been. used by
+	 * the iterator to advance a shared solid-run decoder past this entry before
+	 * yielding the next one.
+	 * @ignore
+	 */
+	async _drain(): Promise<void> {
+		if (this.#decoder !== undefined) {
+			await this.#materialize();
+		}
+	}
 }
 
 // #endregion
@@ -398,8 +438,8 @@ export class Rar3Entry {
  * data spans volumes is yielded once after its final segment is seen.
  * superseded file versions are omitted.
  *
- * the compressed methods (0x31-0x35) are recognized but not yet decompressed;
- * reading the body of such an entry throws.
+ * compressed entries flow through the LZSS decoder; PPMd blocks and the VM
+ * filter symbol throw at read time, pending implementations of each.
  *
  * @param source one reader for a single-volume archive, or the ordered set of
  * volume readers for a multi-volume archive
@@ -414,6 +454,9 @@ export async function* unrar3(
 
 	let openHead: FileBlock | undefined;
 	let openSegments: DataSegment[] = [];
+
+	let decoder: Rar3Decoder | undefined;
+	let pending: Rar3Entry | undefined;
 
 	for await (const { reader, block } of walkVolumes(readers)) {
 		if (block.kind !== 'file') {
@@ -455,7 +498,37 @@ export async function* unrar3(
 		openHead = undefined;
 		openSegments = [];
 
-		yield new Rar3Entry(head, segments, finalCrc);
+		const method = head.method;
+		const solid = (head.fileFlags & FileFlag.solid) !== 0;
+		const dictSize = dictionarySizeFromFlags(head.fileFlags);
+
+		let entry: Rar3Entry;
+		if (method === CompressMethod.stored) {
+			// stored entries skip the LZSS decoder, but the decoder state has to
+			// keep up if a later solid run depends on this entry's bytes — RAR3
+			// does not write stored entries into a solid run, so we can leave
+			// the decoder alone here.
+			entry = new Rar3Entry(head, segments, finalCrc);
+		} else if (!solid) {
+			// the head of a (potentially solid) compressed run gets a fresh
+			// decoder; subsequent solid entries reuse it.
+			decoder = new Rar3Decoder(dictSize);
+			entry = new Rar3Entry(head, segments, finalCrc, decoder);
+		} else if (decoder !== undefined) {
+			// a solid continuation: the previous entry must finish decoding so
+			// the shared tables and dictionary are in the right state.
+			if (pending !== undefined) {
+				await pending._drain();
+			}
+			entry = new Rar3Entry(head, segments, finalCrc, decoder);
+		} else {
+			// solid entry without a preceding run head; report at read time so
+			// callers can choose to skip it without aborting the iteration.
+			entry = new Rar3Entry(head, segments, finalCrc);
+		}
+
+		pending = entry;
+		yield entry;
 	}
 
 	if (openHead !== undefined) {
@@ -464,5 +537,14 @@ export async function* unrar3(
 		);
 	}
 }
+
+// returns the dictionary size in bytes implied by an entry's file flags.
+const dictionarySizeFromFlags = (fileFlags: number): number => {
+	const dict = fileFlags & FileFlag.dictMask;
+	if (dict === FileFlag.directory) {
+		return 64 * 1024;
+	}
+	return 64 * 1024 << (dict >> 5);
+};
 
 // #endregion

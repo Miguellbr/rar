@@ -22,9 +22,11 @@ const PER_FILE_SKIP = new Set([
 	'rar3-old.r00',
 	'rar3-old.r01',
 	'rar3-old.rar',
+	'rar3-solid.rar',
 	'rar3-vols.part1.rar',
 	'rar3-vols.part2.rar',
 	'rar3-vols.part3.rar',
+	'unicode.rar',
 ]);
 
 const fixtures = [...Deno.readDirSync(FIXTURES_DIR)]
@@ -185,36 +187,64 @@ Deno.test('rar3 extract: rar3-vols rejects a standalone middle volume', async ()
 	}
 });
 
-Deno.test('rar3 extract: compressed entry surfaces metadata but throws on read', async () => {
-	// rar3-comment-plain.rar's entries are method=0x33 (normal) stored at 8
-	// bytes each — listing them is fine, but reading the body must error.
-	const data = Deno.readFileSync(new URL('rar3-comment-plain.rar', FIXTURES_DIR));
-	const reader = fromUint8Array(data);
+Deno.test({
+	name: 'rar3 extract: seektest stest1 (compressed) matches stest2 (stored)',
+	// the encoder runs an x86 filter (symbol 257) even on plain ASCII as a
+	// "just in case" pass; until the RAR3 VM lands the compressed body
+	// cannot be reconstructed. re-enable once filters are implemented.
+	ignore: true,
+	fn: async () => {
+		const data = Deno.readFileSync(new URL('seektest.rar', FIXTURES_DIR));
+		const reader = fromUint8Array(data);
 
-	let saw = false;
-	for await (const entry of unrar3(reader)) {
-		if (entry.isDirectory) continue;
-		if (entry.compressionMethod === 0x30) continue;
-		saw = true;
+		const byName = new Map<string, Uint8Array>();
+		for await (const entry of unrar3(reader)) {
+			byName.set(entry.filename, await entry.bytes());
+		}
+
+		const stest1 = byName.get('stest1.txt');
+		const stest2 = byName.get('stest2.txt');
+		if (stest1 === undefined || stest2 === undefined) {
+			throw new Error('expected both stest1.txt and stest2.txt');
+		}
+		if (stest1.length !== stest2.length) {
+			throw new Error(`size mismatch: stest1=${stest1.length} stest2=${stest2.length}`);
+		}
+		for (let idx = 0; idx < stest1.length; idx++) {
+			if (stest1[idx] !== stest2[idx]) {
+				throw new Error(`byte ${idx} differs: stest1=${stest1[idx]} stest2=${stest2[idx]}`);
+			}
+		}
+	},
+});
+
+Deno.test('rar3 extract: compressed entries with non-LZSS features throw gracefully', async () => {
+	// the encoder runs a VM filter ("just in case") on rar3-solid.rar and
+	// switches to PPMd on unicode.rar. listing the entries still works; only
+	// the body read surfaces a "not yet supported" error.
+	const fixtures: Array<{ name: string; needle: string }> = [
+		{ name: 'rar3-solid.rar', needle: 'vm filters' },
+		{ name: 'unicode.rar', needle: 'ppmd' },
+	];
+
+	for (const { name, needle } of fixtures) {
+		const data = Deno.readFileSync(new URL(name, FIXTURES_DIR));
+		const reader = fromUint8Array(data);
 
 		let threw = false;
 		try {
-			await entry.bytes();
+			for await (const entry of unrar3(reader)) {
+				if (entry.isDirectory || entry.compressionMethod === 0x30) continue;
+				await entry.bytes();
+			}
 		} catch (error) {
 			threw = true;
-			if (
-				!(error instanceof Error) ||
-				!error.message.includes('not yet supported')
-			) {
-				throw new Error(`unexpected error: ${error}`);
+			if (!(error instanceof Error) || !error.message.includes(needle)) {
+				throw new Error(`${name}: unexpected error: ${error}`);
 			}
 		}
 		if (!threw) {
-			throw new Error(`expected compressed entry ${entry.filename} to throw on read`);
+			throw new Error(`${name}: expected a "${needle}" error`);
 		}
-	}
-
-	if (!saw) {
-		throw new Error('expected at least one compressed entry in rar3-comment-plain.rar');
 	}
 });
