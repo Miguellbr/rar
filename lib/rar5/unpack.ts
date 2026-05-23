@@ -327,7 +327,7 @@ const FILTER_ARM = 3;
 
 interface Filter {
 	type: number;
-	/** absolute window offset the filter transforms */
+	/** absolute window offset the filter transforms, in monotonic write coordinates */
 	blockStart: number;
 	blockLength: number;
 	/** interleaved channel count, for the delta filter */
@@ -372,37 +372,50 @@ const writeLe32 = (data: Uint8Array, offset: number, value: number): void => {
 	data[offset + 3] = value >>> 24;
 };
 
-// transforms a filtered window region, returning the corrected bytes.
-const runFilter = (filter: Filter, window: Uint8Array): Uint8Array => {
+// transforms a filtered window region, returning the corrected bytes. the
+// window is read modulo `mask + 1`, so the same routine serves both the
+// dictionary-sized circular window used across solid runs and the one-shot
+// window used for standalone entries.
+const runFilter = (filter: Filter, window: Uint8Array, mask: number): Uint8Array => {
 	const { blockLength, blockStart, channels, type } = filter;
 	const out = new Uint8Array(blockLength);
 
+	// stage the filter's input bytes from the (possibly circular) window into a
+	// linear scratch buffer; non-delta filters then read and write in place.
+	for (let idx = 0; idx < blockLength; idx++) {
+		out[idx] = window[(blockStart + idx) & mask];
+	}
+
 	switch (type) {
 		case FILTER_DELTA: {
-			// each channel is delta-decoded independently, then interleaved.
+			// each channel is delta-decoded independently, then interleaved. the
+			// scratch buffer carries the source bytes; results go into a fresh
+			// buffer to avoid clobbering still-unread source bytes.
+			const result = new Uint8Array(blockLength);
 			let source = 0;
 			for (let channel = 0; channel < channels; channel++) {
 				let previous = 0;
 				for (let dest = channel; dest < blockLength; dest += channels) {
-					previous = (previous - window[blockStart + source]) & 0xff;
-					out[dest] = previous;
+					previous = (previous - out[source]) & 0xff;
+					result[dest] = previous;
 					source++;
 				}
 			}
-			return out;
+			return result;
 		}
 		case FILTER_E8:
 		case FILTER_E8E9: {
 			// rewrites x86 call/jump targets from relative to absolute form.
-			out.set(window.subarray(blockStart, blockStart + blockLength));
 			const extended = type === FILTER_E8E9;
 			const fileSize = 0x1000000;
 
 			for (let idx = 0; idx < blockLength - 4;) {
-				const opcode = window[blockStart + idx++];
+				const opcode = out[idx++];
 				if (opcode === 0xe8 || (extended && opcode === 0xe9)) {
+					// blockStart is monotonic; use floating-point modulo to keep
+					// `at` correct past the 32-bit boundary in long solid runs.
 					const at = (idx + blockStart) % fileSize;
-					const addr = readLe32(window, blockStart + idx);
+					const addr = readLe32(out, idx);
 
 					if (addr & 0x80000000) {
 						if (((addr + at) & 0x80000000) === 0) {
@@ -419,12 +432,10 @@ const runFilter = (filter: Filter, window: Uint8Array): Uint8Array => {
 		}
 		case FILTER_ARM: {
 			// rewrites ARM branch-and-link instruction offsets.
-			out.set(window.subarray(blockStart, blockStart + blockLength));
-
 			for (let idx = 0; idx < blockLength - 3; idx += 4) {
-				if (window[blockStart + idx + 3] === 0xeb) {
-					let offset = readLe32(window, blockStart + idx) & 0x00ffffff;
-					offset = (offset - ((idx + blockStart) >> 2)) & 0x00ffffff;
+				if (out[idx + 3] === 0xeb) {
+					let offset = readLe32(out, idx) & 0x00ffffff;
+					offset = (offset - Math.floor((idx + blockStart) / 4)) & 0x00ffffff;
 					writeLe32(out, idx, (offset | 0xeb000000) >>> 0);
 				}
 			}
@@ -453,179 +464,227 @@ const decodeLength = (code: number, bits: BitReader): number => {
 };
 
 /**
- * decompresses the data area of a RAR5 file entry.
+ * a stateful RAR5 decoder.
  *
- * this handles non-solid entries whose uncompressed size does not exceed the
- * dictionary size, which the entry's data area is decoded into directly.
+ * one instance carries the sliding window, repeat-distance cache, last match
+ * length, Huffman tables, and pending filter list across {@link Rar5Decoder.decode}
+ * calls. each call extracts the data of a single archive entry; consecutive
+ * calls represent the entries of a solid run sharing one decompression state.
  *
- * @param compressed the entry's compressed data area
- * @param unpackedSize the expected uncompressed size
- * @param dictionarySizeExponent the dictionary-size exponent from the entry's
- * compression information field
- * @returns the uncompressed bytes
- * @throws if the stream uses a feature that is not yet supported, or is invalid
+ * the window is sized from the dictionary exponent passed to the constructor
+ * and is held internally as a circular buffer; entries' uncompressed output is
+ * still returned as a contiguous, freshly allocated buffer.
  */
-export const decompress = (
-	compressed: Uint8Array,
-	unpackedSize: number,
-	dictionarySizeExponent: number,
-): Uint8Array<ArrayBuffer> => {
-	const windowSize = BASE_WINDOW * 2 ** dictionarySizeExponent;
-	if (unpackedSize > windowSize) {
-		throw new Error(`entries larger than the dictionary are not yet supported`);
+export class Rar5Decoder {
+	readonly #windowSize: number;
+	readonly #windowMask: number;
+	readonly #window: Uint8Array;
+
+	#distCache: [number, number, number, number] = [0, 0, 0, 0];
+	#lastLength = 0;
+	/** monotonic count of bytes ever written to the window */
+	#write = 0;
+	#tables?: Tables;
+	#filters: Filter[] = [];
+
+	/**
+	 * @param dictionarySizeExponent the dictionary-size exponent from the entry's
+	 * compression information field; the window size is `0x20000 << exponent`
+	 */
+	constructor(dictionarySizeExponent: number) {
+		this.#windowSize = BASE_WINDOW * 2 ** dictionarySizeExponent;
+		this.#windowMask = this.#windowSize - 1;
+		this.#window = new Uint8Array(this.#windowSize);
 	}
 
-	// the window holds raw decoded bytes; filters transform regions of it on
-	// the way to the final output.
-	const window = new Uint8Array(unpackedSize);
-	const filters: Filter[] = [];
+	/**
+	 * decodes the data area of one RAR5 file entry, appending its bytes to the
+	 * shared window.
+	 *
+	 * the returned buffer is a fresh allocation independent of the window, with
+	 * any pending filters whose range falls within the entry already applied.
+	 *
+	 * @param compressed the entry's compressed data area
+	 * @param unpackedSize the expected uncompressed size
+	 * @returns the uncompressed bytes
+	 * @throws if the stream is invalid or uses a feature not yet supported
+	 */
+	decode(compressed: Uint8Array, unpackedSize: number): Uint8Array<ArrayBuffer> {
+		const mask = this.#windowMask;
+		const window = this.#window;
+		const startWrite = this.#write;
+		const targetWrite = startWrite + unpackedSize;
 
-	// the dist cache holds the four most-recently-used match distances.
-	const distCache = [0, 0, 0, 0];
-	let lastLength = 0;
-	let write = 0;
+		// the LZ copy primitive: bytes are written to the window modulo its
+		// size, and matches may overlap the write pointer so the loop must
+		// proceed byte by byte.
+		const copy = (length: number, distance: number): void => {
+			for (let idx = 0; idx < length; idx++) {
+				window[(this.#write + idx) & mask] = window[(this.#write + idx - distance) & mask];
+			}
+			this.#write += length;
+		};
 
-	// copies a previously written run, handling overlap byte by byte.
-	const copy = (length: number, distance: number): void => {
-		for (let idx = 0; idx < length; idx++) {
-			window[write + idx] = window[write + idx - distance];
-		}
-		write += length;
-	};
+		let offset = 0;
 
-	let tables: Tables | undefined;
-	let offset = 0;
+		while (this.#write < targetWrite) {
+			const header = parseBlockHeader(compressed, offset);
+			offset += header.headerSize;
 
-	while (write < unpackedSize) {
-		const header = parseBlockHeader(compressed, offset);
-		offset += header.headerSize;
+			const block = new Uint8Array(header.blockSize + 8);
+			block.set(compressed.subarray(offset, offset + header.blockSize));
+			offset += header.blockSize;
 
-		const block = new Uint8Array(header.blockSize + 8);
-		block.set(compressed.subarray(offset, offset + header.blockSize));
-		offset += header.blockSize;
+			const bits = new BitReader(block);
+			if (header.tablePresent) {
+				this.#tables = parseTables(block, bits);
+			}
+			if (this.#tables === undefined) {
+				throw new Error(`block references huffman tables that were never defined`);
+			}
+			const tables = this.#tables;
 
-		const bits = new BitReader(block);
-		if (header.tablePresent) {
-			tables = parseTables(block, bits);
-		}
-		if (tables === undefined) {
-			throw new Error(`block references huffman tables that were never defined`);
-		}
+			const blockBitSize = 1 + header.bitSize;
+			const lastByte = header.blockSize - 1;
 
-		const blockBitSize = 1 + header.bitSize;
-		const lastByte = header.blockSize - 1;
+			while (this.#write < targetWrite) {
+				if (bits.addr > lastByte || (bits.addr === lastByte && bits.bit >= blockBitSize)) {
+					break;
+				}
 
-		while (write < unpackedSize) {
-			if (bits.addr > lastByte || (bits.addr === lastByte && bits.bit >= blockBitSize)) {
+				const symbol = decodeNumber(tables.literal, bits);
+
+				if (symbol < 256) {
+					window[this.#write++ & mask] = symbol;
+					continue;
+				}
+
+				if (symbol === 256) {
+					this.#filters.push(parseFilter(bits, this.#write));
+					continue;
+				}
+
+				if (symbol === 257) {
+					if (this.#lastLength !== 0) {
+						copy(this.#lastLength, this.#distCache[0]);
+					}
+					continue;
+				}
+
+				if (symbol < 262) {
+					// a match reusing one of the cached distances
+					const cacheIndex = symbol - 258;
+					const distance = this.#distCache[cacheIndex];
+					for (let idx = cacheIndex; idx > 0; idx--) {
+						this.#distCache[idx] = this.#distCache[idx - 1];
+					}
+					this.#distCache[0] = distance;
+
+					const length = decodeLength(decodeNumber(tables.repeatDistance, bits), bits);
+					this.#lastLength = length;
+					copy(length, distance);
+					continue;
+				}
+
+				// a match with a freshly coded distance
+				let length = decodeLength(symbol - 262, bits);
+				const slot = decodeNumber(tables.distance, bits);
+
+				let distance = 1;
+				let extraBits = 0;
+				if (slot < 4) {
+					distance += slot;
+				} else {
+					extraBits = (slot >> 1) - 1;
+					distance += (2 | (slot & 1)) << extraBits;
+				}
+
+				if (extraBits > 0) {
+					if (extraBits >= 4) {
+						if (extraBits > 4) {
+							const high = bits.peek32();
+							bits.skip(extraBits - 4);
+							distance += (high >>> (36 - extraBits)) << 4;
+						}
+						distance += decodeNumber(tables.lowDistance, bits);
+					} else {
+						distance += bits.read(extraBits);
+					}
+				}
+
+				// longer distances imply the encoder spent fewer length codes.
+				if (distance > 0x100) {
+					length++;
+					if (distance > 0x2000) {
+						length++;
+						if (distance > 0x40000) {
+							length++;
+						}
+					}
+				}
+
+				this.#distCache[3] = this.#distCache[2];
+				this.#distCache[2] = this.#distCache[1];
+				this.#distCache[1] = this.#distCache[0];
+				this.#distCache[0] = distance;
+				this.#lastLength = length;
+				copy(length, distance);
+			}
+
+			if (header.lastBlock) {
 				break;
 			}
-
-			const symbol = decodeNumber(tables.literal, bits);
-
-			if (symbol < 256) {
-				window[write++] = symbol;
-				continue;
-			}
-
-			if (symbol === 256) {
-				filters.push(parseFilter(bits, write));
-				continue;
-			}
-
-			if (symbol === 257) {
-				if (lastLength !== 0) {
-					copy(lastLength, distCache[0]);
-				}
-				continue;
-			}
-
-			if (symbol < 262) {
-				// a match reusing one of the cached distances
-				const cacheIndex = symbol - 258;
-				const distance = distCache[cacheIndex];
-				for (let idx = cacheIndex; idx > 0; idx--) {
-					distCache[idx] = distCache[idx - 1];
-				}
-				distCache[0] = distance;
-
-				const length = decodeLength(decodeNumber(tables.repeatDistance, bits), bits);
-				lastLength = length;
-				copy(length, distance);
-				continue;
-			}
-
-			// a match with a freshly coded distance
-			let length = decodeLength(symbol - 262, bits);
-			const slot = decodeNumber(tables.distance, bits);
-
-			let distance = 1;
-			let extraBits = 0;
-			if (slot < 4) {
-				distance += slot;
-			} else {
-				extraBits = (slot >> 1) - 1;
-				distance += (2 | (slot & 1)) << extraBits;
-			}
-
-			if (extraBits > 0) {
-				if (extraBits >= 4) {
-					if (extraBits > 4) {
-						const high = bits.peek32();
-						bits.skip(extraBits - 4);
-						distance += (high >>> (36 - extraBits)) << 4;
-					}
-					distance += decodeNumber(tables.lowDistance, bits);
-				} else {
-					distance += bits.read(extraBits);
-				}
-			}
-
-			// longer distances imply the encoder spent fewer length codes.
-			if (distance > 0x100) {
-				length++;
-				if (distance > 0x2000) {
-					length++;
-					if (distance > 0x40000) {
-						length++;
-					}
-				}
-			}
-
-			distCache[3] = distCache[2];
-			distCache[2] = distCache[1];
-			distCache[1] = distCache[0];
-			distCache[0] = distance;
-			lastLength = length;
-			copy(length, distance);
 		}
 
-		if (header.lastBlock) {
-			break;
+		if (this.#write !== targetWrite) {
+			throw new Error(`decompressed ${this.#write - startWrite} bytes, expected ${unpackedSize}`);
 		}
+
+		return this.#materialize(startWrite, unpackedSize);
 	}
 
-	if (write !== unpackedSize) {
-		throw new Error(`decompressed ${write} bytes, expected ${unpackedSize}`);
+	// copies the entry's bytes out of the window and applies any pending filters
+	// whose range falls within the entry. filters that ended before the entry
+	// started are discarded; ones that extend past the entry are kept for a
+	// later call. a filter that straddles the entry boundary is rejected.
+	#materialize(startWrite: number, unpackedSize: number): Uint8Array<ArrayBuffer> {
+		const mask = this.#windowMask;
+		const window = this.#window;
+		const endWrite = startWrite + unpackedSize;
+
+		const output = new Uint8Array(unpackedSize);
+		for (let idx = 0; idx < unpackedSize; idx++) {
+			output[idx] = window[(startWrite + idx) & mask];
+		}
+
+		if (this.#filters.length === 0) {
+			return output;
+		}
+
+		const remaining: Filter[] = [];
+		for (const filter of this.#filters) {
+			const end = filter.blockStart + filter.blockLength;
+
+			if (end <= startWrite) {
+				// filter range already passed; the bytes are no longer in the window
+				continue;
+			}
+			if (filter.blockStart >= endWrite) {
+				remaining.push(filter);
+				continue;
+			}
+			if (filter.blockStart < startWrite || end > endWrite) {
+				throw new Error(`filter straddles entry boundary`);
+			}
+
+			const filtered = runFilter(filter, window, mask);
+			output.set(filtered, filter.blockStart - startWrite);
+		}
+
+		this.#filters = remaining;
+
+		return output;
 	}
-
-	if (filters.length === 0) {
-		return window;
-	}
-
-	// stitch the output from raw window segments and filter-transformed ones.
-	// the format guarantees filters are ordered and non-overlapping.
-	const output = new Uint8Array(unpackedSize);
-	let cursor = 0;
-
-	for (const filter of filters) {
-		output.set(window.subarray(cursor, filter.blockStart), cursor);
-		output.set(runFilter(filter, window), filter.blockStart);
-		cursor = filter.blockStart + filter.blockLength;
-	}
-
-	output.set(window.subarray(cursor), cursor);
-
-	return output;
-};
+}
 
 // #endregion

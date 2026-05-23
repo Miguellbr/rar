@@ -5,7 +5,7 @@ import type { FileBlock } from './block.ts';
 import { isDirectory, isSymlink, parseBlock } from './block.ts';
 import { BlockFlag, COMPRESSION_SOLID, RAR5_SIGNATURE } from './constants.ts';
 import { Cursor } from './cursor.ts';
-import { decompress } from './unpack.ts';
+import { Rar5Decoder } from './unpack.ts';
 
 /**
  * @module
@@ -15,7 +15,11 @@ import { decompress } from './unpack.ts';
  */
 
 // reads exactly `length` bytes from the reader at `offset`.
-const readBytes = async (reader: Reader, offset: number, length: number): Promise<Uint8Array> => {
+const readBytes = async (
+	reader: Reader,
+	offset: number,
+	length: number,
+): Promise<Uint8Array<ArrayBuffer>> => {
 	return await read(await reader.read(offset, length), length);
 };
 
@@ -89,16 +93,22 @@ async function* walkArchive(reader: Reader): AsyncGenerator<FileBlock> {
  *
  * metadata is available immediately; the entry's content is read lazily from
  * the archive when {@link RarEntry.body} or one of the convenience readers is
- * accessed.
+ * accessed. an entry that belongs to a solid run shares its decompression
+ * state with the entries preceding it; the {@link unrar} iterator drives that
+ * coordination so callers can simply consume entries in order.
  */
 export class RarEntry {
 	readonly #reader: Reader;
 	readonly #block: FileBlock;
+	readonly #decoder?: Rar5Decoder;
+
+	#bytes?: Promise<Uint8Array<ArrayBuffer>>;
 
 	/** @ignore */
-	constructor(reader: Reader, block: FileBlock) {
+	constructor(reader: Reader, block: FileBlock, decoder?: Rar5Decoder) {
 		this.#reader = reader;
 		this.#block = block;
+		this.#decoder = decoder;
 	}
 
 	/**
@@ -199,40 +209,44 @@ export class RarEntry {
 		return this.#block.attributes;
 	}
 
+	// resolves to the entry's decompressed bytes, computing them once and
+	// caching the result. for an entry with a shared decoder, the iterator
+	// awaits this before yielding the next solid entry so the decoder state
+	// stays in sync with archive order.
+	#materialize(): Promise<Uint8Array<ArrayBuffer>> {
+		if (this.#bytes === undefined) {
+			this.#bytes = this.#decode();
+		}
+		return this.#bytes;
+	}
+
+	async #decode(): Promise<Uint8Array<ArrayBuffer>> {
+		const block = this.#block;
+
+		if (block.encryption !== undefined) {
+			throw new Error(`cannot read ${block.name}: encrypted entries are not yet supported`);
+		}
+
+		const compressed = await readBytes(this.#reader, block.dataOffset, block.dataSize);
+
+		if (this.#decoder === undefined) {
+			// a stored entry's data area is its content verbatim.
+			return compressed;
+		}
+
+		return this.#decoder.decode(compressed, block.unpackedSize);
+	}
+
 	/**
 	 * a readable stream of the entry's decompressed content.
 	 * @returns a stream of the entry data
 	 */
 	get body(): ReadableStream<Uint8Array> {
-		const reader = this.#reader;
-		const block = this.#block;
-
 		return deferStream(async () => {
-			if (block.encryption !== undefined) {
-				throw new Error(`cannot read ${block.name}: encrypted entries are not yet supported`);
-			}
-
-			// a stored entry's data area is its content verbatim.
-			if (((block.compressionInfo >> 7) & 0x07) === 0) {
-				return await reader.read(block.dataOffset, block.dataSize);
-			}
-
-			if (block.compressionInfo & COMPRESSION_SOLID) {
-				throw new Error(
-					`cannot read ${block.name}: solid compressed entries are not yet supported`,
-				);
-			}
-
-			const compressed = await readBytes(reader, block.dataOffset, block.dataSize);
-			const output = decompress(
-				compressed,
-				block.unpackedSize,
-				(block.compressionInfo >> 10) & 15,
-			);
-
+			const bytes = await this.#materialize();
 			return new ReadableStream({
 				start(controller) {
-					controller.enqueue(output);
+					controller.enqueue(bytes);
 					controller.close();
 				},
 			});
@@ -244,7 +258,7 @@ export class RarEntry {
 	 * @returns the content as a Uint8Array
 	 */
 	async bytes(): Promise<Uint8Array<ArrayBuffer>> {
-		return await read(this.body, this.size);
+		return await this.#materialize();
 	}
 
 	/**
@@ -284,6 +298,18 @@ export class RarEntry {
 	async json(): Promise<unknown> {
 		return JSON.parse(await this.text());
 	}
+
+	/**
+	 * forces the entry's body to be decoded if it has not already been. used by
+	 * the iterator to advance a shared solid-run decoder past this entry before
+	 * yielding the next one.
+	 * @ignore
+	 */
+	async _drain(): Promise<void> {
+		if (this.#decoder !== undefined) {
+			await this.#materialize();
+		}
+	}
 }
 
 /**
@@ -293,15 +319,52 @@ export class RarEntry {
  * their headers are walked. superseded file versions and the trailing parts of
  * split files are omitted.
  *
+ * entries that belong to a solid run share a single decompression window; the
+ * iterator ensures the previous entry's body is materialized before yielding
+ * the next solid entry, so consumers can treat them like any other entry.
+ *
  * @param reader data source to read the archive from
  * @returns async generator yielding the archive's file entries
  * @throws if the source is not a RAR5 archive or a header fails validation
  */
 export async function* unrar(reader: Reader): AsyncGenerator<RarEntry> {
+	let decoder: Rar5Decoder | undefined;
+	let pending: RarEntry | undefined;
+
 	for await (const block of walkArchive(reader)) {
 		// superseded versions and split continuations are not standalone entries.
-		if (block.version === undefined && !(block.blockFlags & BlockFlag.splitBefore)) {
-			yield new RarEntry(reader, block);
+		if (block.version !== undefined || (block.blockFlags & BlockFlag.splitBefore) !== 0) {
+			continue;
 		}
+
+		const method = (block.compressionInfo >> 7) & 0x07;
+		const solid = (block.compressionInfo & COMPRESSION_SOLID) !== 0;
+		const dictExp = (block.compressionInfo >> 10) & 0x0f;
+
+		let entry: RarEntry;
+
+		if (method === 0) {
+			// a stored entry is independent of any solid run; reading it does not
+			// touch the decoder's state.
+			entry = new RarEntry(reader, block);
+		} else if (!solid) {
+			// the head of a (potentially solid) run gets a fresh decoder.
+			decoder = new Rar5Decoder(dictExp);
+			entry = new RarEntry(reader, block, decoder);
+		} else if (decoder !== undefined) {
+			// a continuation of the current solid run; the previous entry must
+			// finish decoding so the shared window is in the right state.
+			if (pending !== undefined) {
+				await pending._drain();
+			}
+			entry = new RarEntry(reader, block, decoder);
+		} else {
+			// a solid entry without a preceding run head; surface as an error at
+			// read time rather than silently producing wrong bytes.
+			entry = new RarEntry(reader, block);
+		}
+
+		pending = entry;
+		yield entry;
 	}
 }
