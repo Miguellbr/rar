@@ -6,7 +6,7 @@ import type { FileBlock, FileEncryption } from './block.ts';
 import { isDirectory, isSymlink, parseBlock } from './block.ts';
 import { BlockFlag, COMPRESSION_SOLID, FileEncryptionFlag, RAR5_SIGNATURE } from './constants.ts';
 import type { DerivedKeys } from './crypto.ts';
-import { decryptAesCbc, deriveKeys, importAesKey } from './crypto.ts';
+import { decryptAesCbc, decryptAesCbcStream, deriveKeys, importAesKey } from './crypto.ts';
 import { Cursor } from './cursor.ts';
 import { Rar5Decoder } from './unpack.ts';
 
@@ -68,41 +68,9 @@ interface DataSegment {
 	size: number;
 }
 
-// reads the bytes of a single segment.
-const readSegment = (segment: DataSegment): Promise<Uint8Array<ArrayBuffer>> => {
-	return readBytes(segment.reader, segment.offset, segment.size);
-};
-
-// concatenates the bytes of every data segment into one buffer. used to feed
-// the decompressor when an entry's data is split across multiple volumes.
-const readSegments = async (segments: DataSegment[]): Promise<Uint8Array<ArrayBuffer>> => {
-	if (segments.length === 1) {
-		return await readSegment(segments[0]);
-	}
-
-	let total = 0;
-	for (const segment of segments) {
-		total += segment.size;
-	}
-
-	const chunks = await Promise.all(segments.map(readSegment));
-	return concat(chunks, total);
-};
-
-// wraps an in-memory buffer in a ReadableStream that emits it as one chunk.
-const bufferStream = (data: Uint8Array<ArrayBuffer>): ReadableStream<Uint8Array<ArrayBuffer>> => {
-	return new ReadableStream({
-		start(controller) {
-			if (data.length > 0) {
-				controller.enqueue(data);
-			}
-			controller.close();
-		},
-	});
-};
-
-// pulls the bytes of every segment through one ReadableStream. for stored
-// entries this avoids buffering the whole payload in memory.
+// pulls the bytes of every segment through one ReadableStream, in order, so
+// the decoder (or AES-CBC decrypt stream) can read an entry's data area
+// without ever buffering the whole payload in memory.
 const streamSegments = (segments: DataSegment[]): ReadableStream<Uint8Array<ArrayBuffer>> => {
 	let index = 0;
 	let current: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>> | undefined;
@@ -475,14 +443,9 @@ export class RarEntry {
 	async #decode(): Promise<Uint8Array<ArrayBuffer>[]> {
 		const encryption = this.#head.encryption;
 
-		// for an encrypted entry, the cipher pass still buffers the whole data
-		// area: Web Crypto's AES-CBC primitive is one-shot, so we read the
-		// segments fully, decrypt, and feed the cleartext to the decoder as if
-		// it were a single-chunk stream. streaming AES-CBC is a separate task.
 		let source: ReadableStream<Uint8Array<ArrayBuffer>>;
 		if (encryption !== undefined) {
-			const ciphertext = await readSegments(this.#segments);
-			source = bufferStream(await this.#decryptDataArea(encryption, ciphertext));
+			source = await this.#decryptStream(encryption);
 		} else {
 			source = streamSegments(this.#segments);
 		}
@@ -518,13 +481,12 @@ export class RarEntry {
 		return chunks;
 	}
 
-	// decrypts an entry's full ciphertext, verifying the stored password check
-	// value when present so the caller hears about a wrong password before any
-	// decompression attempt runs.
-	async #decryptDataArea(
+	// builds a stream of plaintext bytes from the entry's encrypted data area,
+	// verifying the stored password check value up front so a wrong password
+	// surfaces before any decryption work runs.
+	async #decryptStream(
 		encryption: FileEncryption,
-		ciphertext: Uint8Array<ArrayBuffer>,
-	): Promise<Uint8Array<ArrayBuffer>> {
+	): Promise<ReadableStream<Uint8Array<ArrayBuffer>>> {
 		if (this.#keys === undefined) {
 			throw new Error(
 				`cannot read ${this.#head.name}: a password is required for encrypted entries`,
@@ -548,7 +510,7 @@ export class RarEntry {
 		// the IV (and the rest of the encryption record) was sliced out of the
 		// archive header bytes, whose array buffer is not exposed to Web Crypto's
 		// narrowed `BufferSource`; a 16-byte copy detaches it cleanly.
-		return await decryptAesCbc(aes, encryption.iv.slice(), ciphertext);
+		return decryptAesCbcStream(aes, encryption.iv.slice(), streamSegments(this.#segments));
 	}
 
 	/**

@@ -125,6 +125,30 @@ export const importAesKey = (keyBytes: Uint8Array<ArrayBuffer>): Promise<CryptoK
 	return crypto.subtle.importKey('raw', keyBytes, 'AES-CBC', false, ['decrypt', 'encrypt']);
 };
 
+// decrypts one CBC batch of `B` aligned bytes by appending a synthetic
+// PKCS#7-padded block so Web Crypto, which only does padded AES-CBC, returns
+// exactly `B` plaintext bytes. the synthetic block is `encrypt(empty)` keyed
+// by the batch's last ciphertext block as IV — that always produces a block
+// whose pre-stripping plaintext is `0x10` × 16, valid padding to strip.
+const decryptCbcBatch = async (
+	key: CryptoKey,
+	iv: Uint8Array<ArrayBuffer>,
+	batch: Uint8Array<ArrayBuffer>,
+): Promise<Uint8Array<ArrayBuffer>> => {
+	const lastBlock = batch.subarray(batch.length - 16);
+	const paddingBlock = new Uint8Array(
+		await crypto.subtle.encrypt({ iv: lastBlock, name: 'AES-CBC' }, key, new Uint8Array(0)),
+	);
+
+	const augmented = new Uint8Array(batch.length + 16);
+	augmented.set(batch);
+	augmented.set(paddingBlock, batch.length);
+
+	return new Uint8Array(
+		await crypto.subtle.decrypt({ iv, name: 'AES-CBC' }, key, augmented),
+	);
+};
+
 /**
  * decrypts an AES-256-CBC ciphertext that has no PKCS#7 padding, as stored in
  * RAR5 file data areas.
@@ -151,20 +175,89 @@ export const decryptAesCbc = async (
 		throw new Error(`encrypted data length ${ciphertext.length} is not a multiple of 16`);
 	}
 
-	// generate a PKCS#7-padded block whose plaintext is exactly `0x10` * 16
-	// when decrypted with `lastBlock` as IV. encrypting any empty input under
-	// any AES-CBC key produces that block, since the only contents are pure
-	// padding.
-	const lastBlock = ciphertext.subarray(ciphertext.length - 16);
-	const paddingBlock = new Uint8Array(
-		await crypto.subtle.encrypt({ iv: lastBlock, name: 'AES-CBC' }, key, new Uint8Array(0)),
-	);
+	return await decryptCbcBatch(key, iv, ciphertext);
+};
 
-	const augmented = new Uint8Array(ciphertext.length + 16);
-	augmented.set(ciphertext);
-	augmented.set(paddingBlock, ciphertext.length);
+// the maximum number of 16-byte cipher blocks that one streaming batch of
+// {@link decryptAesCbcStream} hands to Web Crypto in one call. 4 KiB is a
+// pragmatic balance: large enough that the per-call overhead is amortized,
+// small enough that one batch fits comfortably in CPU cache.
+const STREAM_BATCH_BYTES = 4096;
 
-	return new Uint8Array(
-		await crypto.subtle.decrypt({ iv, name: 'AES-CBC' }, key, augmented),
-	);
+/**
+ * decrypts an AES-256-CBC ciphertext stream incrementally, managing the CBC
+ * IV chain manually so the full ciphertext never has to be buffered. each
+ * emitted chunk is a multiple of 16 bytes, except potentially the final
+ * empty close. as with {@link decryptAesCbc}, the input has no PKCS#7
+ * padding and the output has the same total length as the input.
+ *
+ * @param key the AES-256 key, imported by {@link importAesKey}
+ * @param iv the 16-byte IV from the entry's encryption record; consumed and
+ * not retained
+ * @param source ciphertext chunks in archive order; the total length must be
+ * a multiple of 16 bytes
+ * @returns a stream of plaintext chunks
+ */
+export const decryptAesCbcStream = (
+	key: CryptoKey,
+	iv: Uint8Array<ArrayBuffer>,
+	source: ReadableStream<Uint8Array<ArrayBuffer>>,
+): ReadableStream<Uint8Array<ArrayBuffer>> => {
+	let chain = iv;
+	// unconsumed ciphertext bytes carried over between pulls because they did
+	// not form a complete 16-byte block or because the running batch had not
+	// yet reached `STREAM_BATCH_BYTES`.
+	let pending: Uint8Array<ArrayBuffer> = new Uint8Array(0);
+	let sourceDone = false;
+	const reader = source.getReader();
+
+	const appendPending = (chunk: Uint8Array<ArrayBuffer>): void => {
+		if (pending.length === 0) {
+			pending = chunk;
+			return;
+		}
+		const merged = new Uint8Array(pending.length + chunk.length);
+		merged.set(pending);
+		merged.set(chunk, pending.length);
+		pending = merged;
+	};
+
+	return new ReadableStream<Uint8Array<ArrayBuffer>>({
+		async pull(controller) {
+			// gather enough buffered ciphertext for one decrypt call, unless the
+			// source has signalled completion — in which case whatever is left
+			// (and which must be 16-aligned at end-of-stream) is the final batch.
+			while (!sourceDone && pending.length < STREAM_BATCH_BYTES) {
+				const { done, value } = await reader.read();
+				if (done) {
+					sourceDone = true;
+					break;
+				}
+				appendPending(value);
+			}
+
+			if (pending.length === 0) {
+				controller.close();
+				return;
+			}
+
+			const aligned = sourceDone ? pending.length : pending.length & ~15;
+			if ((aligned & 15) !== 0) {
+				throw new Error(
+					`encrypted data length ${pending.length} is not a multiple of 16`,
+				);
+			}
+
+			const batch = pending.subarray(0, aligned);
+			const lastBlock = new Uint8Array(batch.subarray(aligned - 16));
+			const plain = await decryptCbcBatch(key, chain, batch);
+			chain = lastBlock;
+			pending = pending.subarray(aligned);
+
+			controller.enqueue(plain);
+		},
+		async cancel() {
+			await reader.cancel();
+		},
+	});
 };
