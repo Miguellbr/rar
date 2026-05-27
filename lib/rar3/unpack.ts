@@ -1280,15 +1280,9 @@ export class Rar3Decoder {
 					this.#ppmd = undefined;
 				} else {
 					this.#tables = undefined;
-					if (mode.init === undefined) {
-						// "reuse" PPMd blocks (solid PPMd continuations) require
-						// the model state from the previous entry to match what
-						// the encoder produced. our port reaches the correct
-						// state for entry 1 but diverges before entry 2 — the
-						// underlying mismatch hasn't been pinned down yet, so
-						// we refuse rather than silently emit wrong bytes.
+					if (mode.init === undefined && this.#ppmd === undefined) {
 						throw new Error(
-							'rar3 ppmd: solid (reuse) PPMd blocks are not yet supported',
+							'rar3 ppmd reuse block with no prior model state',
 						);
 					}
 					// the byte source has to be rebound per block — entry 2 of
@@ -1311,12 +1305,14 @@ export class Rar3Decoder {
 					// wild fit comfortably in memory at per-entry granularity.
 					await ensureBytes(1 << 30);
 					bits!.alignByte();
-					const model = new RAR3PpmdModel(mode.init.dictSize);
+					const model = mode.init !== undefined ? new RAR3PpmdModel(mode.init.dictSize) : this.#ppmd!.model;
 					if (!model.initRangeDecoder(ppmdStream)) {
 						throw new Error('rar3 ppmd range decoder init failed');
 					}
-					model.initEsc = mode.escape;
-					model.init(mode.init.maxorder);
+					if (mode.init !== undefined) {
+						model.initEsc = mode.escape;
+						model.init(mode.init.maxorder);
+					}
 					this.#ppmd = { escape: mode.escape, model };
 				}
 				this.#startNewTable = false;
@@ -1324,14 +1320,14 @@ export class Rar3Decoder {
 
 			if (this.#ppmd !== undefined) {
 				const { model, escape } = this.#ppmd;
-				// PPMd entries terminate on output size, not on an in-stream
-				// marker: the encoder simply stops feeding the model after
-				// writing `unpackedSize` bytes. when `write` catches up to
-				// `targetWrite` we set `startNewTable` so the next decode call
-				// re-reads the next block's parseCodes flags from the fresh
-				// data area.
-				let restartBlock = false;
-				while (this.#write < targetWrite) {
+				// PPMd entries terminate on an in-stream end-of-data marker
+				// (escape + code 2). we must consume it — even after the
+				// output budget is met — so the model state stays in sync
+				// with the encoder for the next solid entry.
+				for (;;) {
+					if (this.#write > targetWrite) {
+						throw new Error(`rar3 wrote past expected ${unpackedSize} bytes`);
+					}
 					if (this.#write - emitted >= FLUSH_HIGH_WATER) {
 						await flush(false);
 					}
@@ -1350,11 +1346,16 @@ export class Rar3Decoder {
 						throw new Error('rar3 ppmd: invalid escape code');
 					}
 					if (code === 0) {
+						// in-stream "new table" marker: loop back to parseCodes.
 						this.#startNewTable = true;
-						restartBlock = true;
 						break;
 					}
 					if (code === 2) {
+						// end-of-data for the current entry. model state
+						// survives; the next entry's decode() must re-parse a
+						// fresh block header and re-prime the range decoder
+						// against its own bit reader.
+						this.#startNewTable = true;
 						endMarkerSeen = true;
 						break;
 					}
@@ -1392,14 +1393,9 @@ export class Rar3Decoder {
 				if (endMarkerSeen) {
 					break;
 				}
-				if (restartBlock) {
-					// loop back to parseCodes for an in-stream block refresh.
-					continue;
-				}
-				// entry's output budget reached. the next decode() call expects
-				// to read a fresh block header from the next entry's data area.
-				this.#startNewTable = true;
-				break;
+				// fell out via the in-stream "new table" marker; loop back
+				// to parseCodes for the refreshed block header.
+				continue;
 			}
 
 			const tables = this.#tables!;

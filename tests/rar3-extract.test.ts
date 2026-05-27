@@ -24,7 +24,6 @@ const PER_FILE_SKIP = new Set([
 	'rar3-vols.part1.rar',
 	'rar3-vols.part2.rar',
 	'rar3-vols.part3.rar',
-	'unicode.rar',
 ]);
 
 // password used by every encrypted fixture in the corpus.
@@ -260,45 +259,31 @@ Deno.test('rar3 extract: password-protected entries decrypt with rar3DeriveKey',
 	}
 });
 
-Deno.test('rar3 extract: PPMd entries — non-solid decodes; solid throws', async () => {
+Deno.test('rar3 extract: PPMd entries — solid reuse block decodes', async () => {
 	// unicode.rar uses PPMd-H. the first entry's block carries the "full
 	// reinit" flag and decodes end to end. the second entry is a "reuse"
-	// (solid) block that depends on the previous entry's final model state;
-	// our port reaches a state mismatch there and refuses rather than
-	// silently producing wrong bytes.
+	// (solid) block whose model state is inherited from the first entry;
+	// only the range decoder is re-primed.
 	const data = Deno.readFileSync(new URL('unicode.rar', FIXTURES_DIR));
 	const reader = fromUint8Array(data);
 
-	let firstBytes: Uint8Array | undefined;
-	let solidErr: Error | undefined;
-	let idx = 0;
+	const decoded: Uint8Array[] = [];
 	for await (const entry of unrar3(reader)) {
 		if (entry.isDirectory || entry.compressionMethod === 0x30) {
-			idx++;
 			continue;
 		}
-		if (idx === 0) {
-			firstBytes = await entry.bytes();
-		} else {
-			try {
-				await entry.bytes();
-			} catch (err) {
-				solidErr = err as Error;
-			}
-		}
-		idx++;
+		decoded.push(await entry.bytes());
 	}
 
-	if (
-		firstBytes === undefined || firstBytes.length !== 2 || firstBytes[0] !== 0x31 || firstBytes[1] !== 0x0a
-	) {
-		throw new Error(
-			`expected first PPMd entry to decode to "1\\n", got ${
-				firstBytes ? JSON.stringify(Array.from(firstBytes)) : 'undefined'
-			}`,
-		);
+	if (decoded.length !== 2) {
+		throw new Error(`expected 2 PPMd entries, got ${decoded.length}`);
 	}
-	if (solidErr === undefined || !solidErr.message.includes('solid')) {
-		throw new Error(`expected a "solid ppmd" error for the second entry, got ${solidErr}`);
+	for (let i = 0; i < 2; i++) {
+		const bytes = decoded[i];
+		if (bytes.length !== 2 || bytes[0] !== 0x31 || bytes[1] !== 0x0a) {
+			throw new Error(
+				`entry ${i}: expected "1\\n", got ${JSON.stringify(Array.from(bytes))}`,
+			);
+		}
 	}
 });
