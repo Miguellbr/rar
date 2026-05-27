@@ -3,6 +3,7 @@ import { crc32 } from '../utils/crc32.ts';
 import { type DataSegment, deferStream, readBytes, streamSegments } from '../utils/segments.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
 
+import type { UnrarOptions } from '../options.ts';
 import type { Reader } from '../reader/types.ts';
 import type { FileBlock, FileEncryption } from './block.ts';
 import { isDirectory, isSymlink, parseBlock } from './block.ts';
@@ -623,16 +624,6 @@ export class Rar5Entry {
 			await this.#materialize();
 		}
 	}
-}
-
-/** options controlling how {@link unrar5} reads an archive. */
-export interface UnrarOptions {
-	/**
-	 * the password used to decrypt entries with encrypted data. password
-	 * derivation is cached per (salt, KDF count) pair, so the work runs once
-	 * for an archive even when many entries are encrypted.
-	 */
-	password?: string;
 }
 
 /**

@@ -2,6 +2,7 @@ import { concat, decodeUtf8From } from '../utils/buffer.ts';
 import { type DataSegment, deferStream, readBytes, streamSegments } from '../utils/segments.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
 
+import type { UnrarOptions } from '../options.ts';
 import type { Reader } from '../reader/types.ts';
 import type { FileBlock, Rar3Block } from './block.ts';
 import { parseBlock } from './block.ts';
@@ -376,12 +377,6 @@ export class Rar3Entry {
 
 // #region unrar3
 
-/** options for {@link unrar3}. */
-export interface Unrar3Options {
-	/** password for password-protected file entries */
-	password?: string;
-}
-
 /**
  * extracts entries from a RAR3 (RAR1.5 - RAR4) archive.
  *
@@ -405,7 +400,7 @@ export interface Unrar3Options {
  */
 export async function* unrar3(
 	source: Reader | readonly Reader[],
-	options?: Unrar3Options,
+	options?: UnrarOptions,
 ): AsyncGenerator<Rar3Entry> {
 	const readers: readonly Reader[] = Array.isArray(source) ? source : [source];
 	const password = options?.password;

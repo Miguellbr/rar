@@ -13,20 +13,21 @@
  */
 
 import { read } from './utils/buffer.ts';
+import type { UnrarOptions } from './options.ts';
 import type { Reader } from './reader/types.ts';
 import { type Rar3Entry, unrar3 } from './rar3/extract.ts';
 import { RAR3_SIGNATURE } from './rar3/constants.ts';
-import { type Rar5Entry, unrar5, type UnrarOptions } from './rar5/extract.ts';
+import { type Rar5Entry, unrar5 } from './rar5/extract.ts';
 import { RAR5_SIGNATURE } from './rar5/constants.ts';
 
 export type * from './reader/types.ts';
 export * from './reader/common.ts';
 
+export type { UnrarOptions } from './options.ts';
 export { Rar5Entry, unrar5 } from './rar5/extract.ts';
-export type { UnrarOptions, VolumeBlock, WalkOptions } from './rar5/extract.ts';
+export type { VolumeBlock, WalkOptions } from './rar5/extract.ts';
 export { walkArchive } from './rar5/extract.ts';
 export { Rar3Entry, unrar3 } from './rar3/extract.ts';
-export type { Unrar3Options } from './rar3/extract.ts';
 
 /**
  * extracts entries from a RAR archive, automatically detecting whether it is
