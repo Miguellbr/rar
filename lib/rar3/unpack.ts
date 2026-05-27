@@ -1002,9 +1002,16 @@ export type DecodeSink = (chunk: Uint8Array<ArrayBuffer>) => void | Promise<void
  * program" error when the filter would execute.
  */
 export class Rar3Decoder {
-	readonly #windowSize: number;
-	readonly #windowMask: number;
-	readonly #window: Uint8Array;
+	/** the maximum window size implied by the file header's dictionary flag,
+	 * rounded up to a power of two. matches with distance up to this value can
+	 * appear in the bit stream. */
+	readonly #targetSize: number;
+	/** the actually-allocated window. starts at zero length and grows toward
+	 * `#targetSize` only when an entry's expected output (or accumulated solid
+	 * history) requires more. for small archives the window never reaches
+	 * `#targetSize`, sparing a multi-megabyte allocation up front. */
+	#window: Uint8Array = new Uint8Array(0);
+	#windowMask = 0;
 
 	/** four-deep LRU of recent match distances, oldest at index 3. */
 	#oldOffsets: [number, number, number, number] = [0, 0, 0, 0];
@@ -1041,21 +1048,51 @@ export class Rar3Decoder {
 	 * RAR3 cap of 4 MiB.
 	 */
 	constructor(dictionarySize: number) {
-		let windowSize = 1;
-		while (windowSize < dictionarySize) {
-			windowSize <<= 1;
+		let target = 1;
+		while (target < dictionarySize) {
+			target <<= 1;
 		}
-		if (windowSize === 0 || windowSize > MAX_DICTIONARY) {
-			windowSize = MAX_DICTIONARY;
+		if (target === 0 || target > MAX_DICTIONARY) {
+			target = MAX_DICTIONARY;
 		}
-		this.#windowSize = windowSize;
-		this.#windowMask = windowSize - 1;
-		this.#window = new Uint8Array(windowSize);
+		this.#targetSize = target;
 	}
 
-	/** size of the LZSS dictionary window this decoder was sized for. */
+	/** the dictionary capacity this decoder was sized for. the underlying
+	 * window may currently be smaller (lazy-allocated to fit decoded content),
+	 * but matches with distances up to this value are guaranteed handlable. */
 	get windowSize(): number {
-		return this.#windowSize;
+		return this.#targetSize;
+	}
+
+	/**
+	 * ensures the window can hold at least `neededWrite` bytes contiguously
+	 * (no circular wraparound), up to `#targetSize`. on growth, existing
+	 * contents at positions `[0, #write)` are preserved one-to-one — this is
+	 * safe because we only grow while still in the no-wrap regime where every
+	 * byte sits at its logical address.
+	 */
+	#ensureCapacity(neededWrite: number): void {
+		const current = this.#window.length;
+		if (current >= this.#targetSize) {
+			return;
+		}
+		if (current >= neededWrite) {
+			return;
+		}
+		let cap = current === 0 ? 1 : current;
+		while (cap < neededWrite) {
+			cap <<= 1;
+		}
+		if (cap > this.#targetSize) {
+			cap = this.#targetSize;
+		}
+		const grown = new Uint8Array(cap);
+		if (this.#write > 0) {
+			grown.set(this.#window.subarray(0, this.#write));
+		}
+		this.#window = grown;
+		this.#windowMask = cap - 1;
 	}
 
 	/**
@@ -1102,9 +1139,15 @@ export class Rar3Decoder {
 	 * program outside the standard set
 	 */
 	async decode(input: StreamReader, unpackedSize: number, sink: DecodeSink): Promise<void> {
+		// size the window to fit this entry's output (plus any accumulated
+		// solid-run history), capped at the declared dictionary target. this
+		// is the only point growth can happen — after this the locals below
+		// pin the buffer for the entry.
+		this.#ensureCapacity(this.#write + unpackedSize);
+
 		const mask = this.#windowMask;
 		const window = this.#window;
-		const windowSize = this.#windowSize;
+		const windowSize = window.length;
 		const startWrite = this.#write;
 		const targetWrite = startWrite + unpackedSize;
 
@@ -1494,7 +1537,7 @@ export class Rar3Decoder {
 					bits!,
 					this.#filterState,
 					this.#write,
-					windowSize,
+					this.#targetSize,
 					ensureBytesOrThrow,
 				);
 				continue;
