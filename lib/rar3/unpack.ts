@@ -1154,8 +1154,13 @@ export class Rar3Decoder {
 		// the longest single LZ copy is ~260 bytes (length base 224 + 31 extra
 		// + base bumps); leave generous headroom so periodic flushing always
 		// runs before the next iteration could overwrite unflushed window data.
+		// when the window grew exactly to fit this entry (still below the
+		// declared cap), writes won't wrap, so unflushed bytes are safe — set
+		// the threshold past `targetWrite` to disable mid-flushing entirely.
 		const FLUSH_MARGIN = 512;
-		const FLUSH_HIGH_WATER = windowSize - FLUSH_MARGIN;
+		const FLUSH_HIGH_WATER = targetWrite > windowSize
+			? windowSize - FLUSH_MARGIN
+			: unpackedSize + 1;
 
 		let emitted = startWrite;
 
