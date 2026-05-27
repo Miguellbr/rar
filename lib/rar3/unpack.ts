@@ -1143,8 +1143,14 @@ export class Rar3Decoder {
 					source = lastFiltered;
 				} else {
 					source = new Uint8Array(f.blockLength);
-					for (let i = 0; i < f.blockLength; i++) {
-						source[i] = window[(f.blockStart + i) & mask];
+					// monotonic range in the circular window — at most one wrap.
+					const startInWindow = f.blockStart & mask;
+					if (startInWindow + f.blockLength <= windowSize) {
+						source.set(window.subarray(startInWindow, startInWindow + f.blockLength));
+					} else {
+						const partA = windowSize - startInWindow;
+						source.set(window.subarray(startInWindow));
+						source.set(window.subarray(0, f.blockLength - partA), partA);
 					}
 				}
 				const entryPos = f.blockStart - startWrite;
@@ -1178,8 +1184,16 @@ export class Rar3Decoder {
 
 			const size = safeEnd - emitted;
 			const chunk = new Uint8Array(size);
-			for (let idx = 0; idx < size; idx++) {
-				chunk[idx] = window[(emitted + idx) & mask];
+			// copy from the window using typed-array `set()` instead of a
+			// byte loop. the window is circular, so a single contiguous
+			// monotonic range can wrap; in that case fall back to two sets.
+			const startInWindow = emitted & mask;
+			if (startInWindow + size <= windowSize) {
+				chunk.set(window.subarray(startInWindow, startInWindow + size));
+			} else {
+				const partA = windowSize - startInWindow;
+				chunk.set(window.subarray(startInWindow));
+				chunk.set(window.subarray(0, size - partA), partA);
 			}
 
 			// overlay ready filters whose range intersects the chunk. any
@@ -1273,10 +1287,25 @@ export class Rar3Decoder {
 		void _;
 
 		const copy = (length: number, distance: number): void => {
-			for (let idx = 0; idx < length; idx++) {
-				window[(this.#write + idx) & mask] = window[(this.#write + idx - distance) & mask];
+			const write = this.#write;
+			// when source and destination ranges don't overlap (distance >=
+			// length), and neither end wraps the window, hand the copy off
+			// to `copyWithin` — a single native memmove instead of a per-byte
+			// js loop. the overlap case (distance < length) needs the runlength
+			// repeat semantics: each new byte may be a byte we just wrote.
+			if (distance >= length) {
+				const dst = write & mask;
+				const src = (write - distance) & mask;
+				if (dst + length <= windowSize && src + length <= windowSize) {
+					window.copyWithin(dst, src, src + length);
+					this.#write = write + length;
+					return;
+				}
 			}
-			this.#write += length;
+			for (let idx = 0; idx < length; idx++) {
+				window[(write + idx) & mask] = window[(write + idx - distance) & mask];
+			}
+			this.#write = write + length;
 		};
 
 		// the loop terminates on the symbol-256 end-of-entry marker rather than

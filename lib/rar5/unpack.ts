@@ -382,10 +382,17 @@ const runFilter = (filter: Filter, window: Uint8Array, mask: number): Uint8Array
 	const { blockLength, blockStart, channels, type } = filter;
 	const out = new Uint8Array(blockLength);
 
-	// stage the filter's input bytes from the (possibly circular) window into a
-	// linear scratch buffer; non-delta filters then read and write in place.
-	for (let idx = 0; idx < blockLength; idx++) {
-		out[idx] = window[(blockStart + idx) & mask];
+	// stage the filter's input bytes from the (possibly circular) window into
+	// a linear scratch buffer; non-delta filters then read and write in place.
+	// the range is monotonic within the window — at most one wrap point.
+	const windowSize = mask + 1;
+	const startInWindow = blockStart & mask;
+	if (startInWindow + blockLength <= windowSize) {
+		out.set(window.subarray(startInWindow, startInWindow + blockLength));
+	} else {
+		const partA = windowSize - startInWindow;
+		out.set(window.subarray(startInWindow));
+		out.set(window.subarray(0, blockLength - partA), partA);
 	}
 
 	switch (type) {
@@ -582,8 +589,15 @@ export class Rar5Decoder {
 
 			const size = safeEnd - emitted;
 			const chunk = new Uint8Array(size);
-			for (let idx = 0; idx < size; idx++) {
-				chunk[idx] = window[(emitted + idx) & mask];
+			// bulk-copy from the (circular) window using `set()`; only the
+			// wrap case needs two passes.
+			const startInWindow = emitted & mask;
+			if (startInWindow + size <= windowSize) {
+				chunk.set(window.subarray(startInWindow, startInWindow + size));
+			} else {
+				const partA = windowSize - startInWindow;
+				chunk.set(window.subarray(startInWindow));
+				chunk.set(window.subarray(0, size - partA), partA);
 			}
 
 			// overlay any ready filter whose range intersects this chunk; one whose
@@ -610,13 +624,25 @@ export class Rar5Decoder {
 		};
 
 		// the LZ copy primitive: bytes are written to the window modulo its
-		// size, and matches may overlap the write pointer so the loop must
-		// proceed byte by byte.
+		// size. matches with `distance < length` repeat the just-written
+		// bytes, so that case needs the per-byte loop; the more common
+		// non-overlapping copy hands off to `copyWithin` for a native
+		// memmove when neither end wraps the window.
 		const copy = (length: number, distance: number): void => {
-			for (let idx = 0; idx < length; idx++) {
-				window[(this.#write + idx) & mask] = window[(this.#write + idx - distance) & mask];
+			const write = this.#write;
+			if (distance >= length) {
+				const dst = write & mask;
+				const src = (write - distance) & mask;
+				if (dst + length <= windowSize && src + length <= windowSize) {
+					window.copyWithin(dst, src, src + length);
+					this.#write = write + length;
+					return;
+				}
 			}
-			this.#write += length;
+			for (let idx = 0; idx < length; idx++) {
+				window[(write + idx) & mask] = window[(write + idx - distance) & mask];
+			}
+			this.#write = write + length;
 		};
 
 		while (this.#write < targetWrite) {
