@@ -3,6 +3,8 @@
   "specifiers": {
     "jsr:@mary/ds-queue@~0.1.3": "0.1.3",
     "jsr:@mary/mutex@0.1": "0.1.0",
+    "jsr:@std/assert@1": "1.0.19",
+    "jsr:@std/internal@^1.0.12": "1.0.12",
     "npm:@types/node@*": "24.1.0"
   },
   "jsr": {
@@ -11,6 +13,15 @@
     },
     "@mary/mutex@0.1.0": {
       "integrity": "491d33bfd019f5467fd33cf75fcad293800c9954d76332865747201cbeecb0fc"
+    },
+    "@std/assert@1.0.19": {
+      "integrity": "eaada96ee120cb980bc47e040f82814d786fe8162ecc53c91d8df60b8755991e",
+      "dependencies": [
+        "jsr:@std/internal"
+      ]
+    },
+    "@std/internal@1.0.12": {
+      "integrity": "972a634fd5bc34b242024402972cd5143eac68d8dffaca5eaa4dba30ce17b027"
     }
   },
   "npm": {
