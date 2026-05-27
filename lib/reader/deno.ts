@@ -15,6 +15,12 @@ import type { Reader } from './types.ts';
 export async function fromFsFile(file: Deno.FsFile): Promise<Reader & Disposable> {
 	const mutex = new Mutex();
 	const totalLength = (await file.stat()).size;
+	// shared across every stream this reader hands out: tracks the OS file
+	// pointer so consecutive pulls that already sit at the right offset can
+	// skip the seek syscall, and a new stream that picks up where a previous
+	// one left off can skip its first seek too. `undefined` forces an initial
+	// seek before the first read.
+	let knownPosition: number | undefined;
 
 	return {
 		length: totalLength,
@@ -27,7 +33,10 @@ export async function fromFsFile(file: Deno.FsFile): Promise<Reader & Disposable
 				async pull(controller) {
 					using _lock = await mutex.acquire();
 
-					await file.seek(offset, Deno.SeekMode.Start);
+					if (knownPosition !== offset) {
+						await file.seek(offset, Deno.SeekMode.Start);
+						knownPosition = offset;
+					}
 
 					const size = Math.min(controller.desiredSize!, remaining);
 
@@ -47,6 +56,7 @@ export async function fromFsFile(file: Deno.FsFile): Promise<Reader & Disposable
 						controller.enqueue(buffer);
 					}
 
+					knownPosition += read;
 					remaining -= read;
 					offset += read;
 
