@@ -23,7 +23,39 @@ export const fromFileHandle = async (handle: FileHandle): Promise<Reader> => {
 
 			return new ReadableStream<Uint8Array<ArrayBuffer>>({
 				type: 'bytes',
-				async pull(controller) {
+				async pull(rawController) {
+					// the underlying source is `type: 'bytes'`, so the runtime
+					// controller is always a byte-stream controller; the
+					// generic-typed parameter just doesn't narrow.
+					const controller = rawController as ReadableByteStreamController;
+
+					// when a BYOB reader is waiting, read straight into the
+					// consumer's buffer and skip the per-pull Uint8Array
+					// allocation + queue copy that the default-reader path
+					// pays on every chunk.
+					const byob = controller.byobRequest;
+					if (byob !== null) {
+						const view = byob.view as Uint8Array<ArrayBuffer>;
+						const cap = view.byteLength <= remaining ? view.byteLength : remaining;
+						const target = cap === view.byteLength ? view : new Uint8Array(view.buffer, view.byteOffset, cap);
+						const { bytesRead } = await handle.read(target, 0, cap, offset);
+
+						if (bytesRead === 0) {
+							byob.respond(0);
+							controller.close();
+							return;
+						}
+
+						remaining -= bytesRead;
+						offset += bytesRead;
+						byob.respond(bytesRead);
+
+						if (remaining <= 0) {
+							controller.close();
+						}
+						return;
+					}
+
 					const size = Math.min(controller.desiredSize!, remaining);
 
 					const buffer = new Uint8Array(size);
