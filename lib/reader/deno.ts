@@ -30,12 +30,44 @@ export async function fromFsFile(file: Deno.FsFile): Promise<Reader & Disposable
 
 			return new ReadableStream<Uint8Array<ArrayBuffer>>({
 				type: 'bytes',
-				async pull(controller) {
+				async pull(rawController) {
+					// the underlying source is `type: 'bytes'`, so the runtime
+					// controller is always a byte-stream controller; the
+					// generic-typed parameter just doesn't narrow.
+					const controller = rawController as ReadableByteStreamController;
 					using _lock = await mutex.acquire();
 
 					if (knownPosition !== offset) {
 						await file.seek(offset, Deno.SeekMode.Start);
 						knownPosition = offset;
+					}
+
+					// when a BYOB reader is waiting, write straight into the
+					// consumer's buffer and skip the per-pull Uint8Array
+					// allocation — saves the producer→queue→consumer memcpy
+					// that the default-reader path pays on every chunk.
+					const byob = controller.byobRequest;
+					if (byob !== null) {
+						const view = byob.view as Uint8Array<ArrayBuffer>;
+						const cap = view.byteLength <= remaining ? view.byteLength : remaining;
+						const target = cap === view.byteLength ? view : new Uint8Array(view.buffer, view.byteOffset, cap);
+						const read = await file.read(target);
+
+						if (read === null) {
+							byob.respond(0);
+							controller.close();
+							return;
+						}
+
+						knownPosition += read;
+						remaining -= read;
+						offset += read;
+						byob.respond(read);
+
+						if (remaining <= 0) {
+							controller.close();
+						}
+						return;
 					}
 
 					const size = Math.min(controller.desiredSize!, remaining);

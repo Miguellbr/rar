@@ -33,6 +33,47 @@ export async function read(
 	stream: ReadableStream<Uint8Array>,
 	size: number,
 ): Promise<Uint8Array<ArrayBuffer>> {
+	// fast path: a byte-type stream lets us request bytes straight into a
+	// pre-allocated buffer with no producer-side memcpy. Web Crypto pipes
+	// (decrypt streams) and user-supplied non-byte sources don't support
+	// BYOB; fall back to the default-reader copy loop when getReader throws.
+	let byob: ReadableStreamBYOBReader | undefined;
+	try {
+		byob = stream.getReader({ mode: 'byob' });
+	} catch {
+		// fall through to default-reader path below
+	}
+
+	if (byob !== undefined) {
+		let buffer = new ArrayBuffer(size);
+		let pos = 0;
+		let drained = false;
+		try {
+			while (pos < size) {
+				const view = new Uint8Array(buffer, pos, size - pos);
+				const { done, value } = await byob.read(view);
+				if (done) {
+					drained = true;
+					break;
+				}
+				// BYOB read transfers the input view's buffer into `value`;
+				// reassign so the next iteration's view sees the live buffer.
+				buffer = value.buffer as ArrayBuffer;
+				pos += value.byteLength;
+			}
+		} finally {
+			if (!drained) {
+				await byob.cancel();
+			} else {
+				byob.releaseLock();
+			}
+		}
+		if (pos < size) {
+			throw new Error(`unexpected end of stream: expected ${size} bytes, got ${pos}`);
+		}
+		return new Uint8Array(buffer, 0, size);
+	}
+
 	const buffer = new Uint8Array(size);
 	const reader = stream.getReader();
 	let pos = 0;
