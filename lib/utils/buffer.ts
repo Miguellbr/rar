@@ -34,28 +34,41 @@ export async function read(
 	size: number,
 ): Promise<Uint8Array<ArrayBuffer>> {
 	const buffer = new Uint8Array(size);
+	const reader = stream.getReader();
+	let pos = 0;
+	let drained = false;
 
-	let read = 0;
-
-	for await (const chunk of stream) {
-		const length = chunk.length;
-		const remaining = Math.min(length, size - read);
-
-		if (remaining === length) {
-			buffer.set(chunk, read);
-		} else {
-			buffer.set(chunk.subarray(0, remaining), read);
+	try {
+		while (pos < size) {
+			const { done, value } = await reader.read();
+			if (done) {
+				drained = true;
+				break;
+			}
+			const length = value.length;
+			const room = size - pos;
+			if (length <= room) {
+				buffer.set(value, pos);
+				pos += length;
+			} else {
+				buffer.set(value.subarray(0, room), pos);
+				pos = size;
+			}
 		}
-
-		read += remaining;
-
-		if (read >= size) {
-			break;
+	} finally {
+		// when the stream is already at end, cancel is a no-op; when we have
+		// enough bytes but the producer might still deliver more (e.g. AES-CBC
+		// padding past the declared plaintext length), cancel releases its
+		// resources without the costly async-iterator `return()` dance.
+		if (!drained) {
+			await reader.cancel();
+		} else {
+			reader.releaseLock();
 		}
 	}
 
-	if (read < size) {
-		throw new Error(`unexpected end of stream: expected ${size} bytes, got ${read}`);
+	if (pos < size) {
+		throw new Error(`unexpected end of stream: expected ${size} bytes, got ${pos}`);
 	}
 
 	return buffer;

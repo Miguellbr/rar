@@ -246,37 +246,34 @@ export class Rar3Entry {
 		}
 
 		const expected = this.#head.unpackedSize;
+
+		if (this.#head.method === CompressMethod.stored) {
+			// stored entries flow straight from the segment readers into a
+			// pre-allocated result buffer; no chunk-list bookkeeping, no final
+			// concat. for an encrypted stored entry, AES-CBC pads the ciphertext
+			// up to a 16-byte block so the source may deliver a few trailing
+			// bytes past `expected`; the read-loop stops at `expected` and
+			// cancels the rest. multi-segment entries still go through the
+			// segment stitcher.
+			const source = this.isEncrypted
+				? await decryptRar3Stream(
+					this.#password!,
+					this.#head.salt!,
+					streamSegments(this.#segments),
+				)
+				: this.#segments.length === 1
+				? await this.#segments[0].reader.read(
+					this.#segments[0].offset,
+					this.#segments[0].size,
+				)
+				: streamSegments(this.#segments);
+			return [await read(source, expected)];
+		}
+
 		const ciphertext = streamSegments(this.#segments);
 		const source = this.isEncrypted
 			? await decryptRar3Stream(this.#password!, this.#head.salt!, ciphertext)
 			: ciphertext;
-
-		if (this.#head.method === CompressMethod.stored) {
-			// stored: the concatenated segment bytes are the content verbatim.
-			// for encrypted entries, AES-CBC pads the ciphertext up to a 16-byte
-			// boundary so we may receive a few trailing bytes past `expected`;
-			// drop them.
-			const collected: Uint8Array<ArrayBuffer>[] = [];
-			let total = 0;
-			for await (const chunk of source) {
-				if (total >= expected) {
-					continue;
-				}
-				if (total + chunk.length > expected) {
-					collected.push(chunk.slice(0, expected - total));
-					total = expected;
-				} else {
-					collected.push(chunk);
-					total += chunk.length;
-				}
-			}
-			if (total !== expected) {
-				throw new Error(
-					`stored data is ${total} bytes, expected ${expected}`,
-				);
-			}
-			return collected;
-		}
 
 		if (this.#decoder === undefined) {
 			throw new Error(

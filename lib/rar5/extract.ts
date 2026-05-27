@@ -1,4 +1,4 @@
-import { concat, decodeUtf8From } from '../utils/buffer.ts';
+import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
 import { crc32 } from '../utils/crc32.ts';
 import { type DataSegment, deferStream, readBytes, streamSegments } from '../utils/segments.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
@@ -410,50 +410,37 @@ export class Rar5Entry {
 
 	async #decode(): Promise<Uint8Array<ArrayBuffer>[]> {
 		const encryption = this.#head.encryption;
+		const expected = this.#head.unpackedSize;
 
-		let source: ReadableStream<Uint8Array<ArrayBuffer>>;
-		if (encryption !== undefined) {
-			source = await this.#decryptStream(encryption);
-		} else {
-			source = streamSegments(this.#segments);
-		}
-
-		const chunks = await this.#runPipeline(source);
-		await this.#verifyCrc32(chunks);
-		return chunks;
-	}
-
-	async #runPipeline(
-		source: ReadableStream<Uint8Array<ArrayBuffer>>,
-	): Promise<Uint8Array<ArrayBuffer>[]> {
 		if (this.#decoder === undefined) {
 			// a stored entry's concatenated bytes are its content verbatim; an
 			// encrypted stored entry is CBC-padded to a 16-byte block, so the
-			// drained payload may run past the declared size and must be trimmed.
-			const expected = this.#head.unpackedSize;
-			const collected: Uint8Array<ArrayBuffer>[] = [];
-			let total = 0;
-			for await (const chunk of source) {
-				collected.push(chunk);
-				total += chunk.length;
-			}
-			if (total < expected) {
-				throw new Error(
-					`stored data is ${total} bytes, expected at least ${expected}`,
-				);
-			}
-			if (total === expected) {
-				return collected.length === 1 ? collected : [concat(collected, total)];
-			}
-			const merged = collected.length === 1 ? collected[0] : concat(collected, total);
-			return [new Uint8Array(merged.buffer, merged.byteOffset, expected)];
+			// drained payload may run past the declared size — the read-loop
+			// stops at `expected` and cancels the rest. unencrypted
+			// single-segment entries bypass the segment-stitcher stream so the
+			// underlying reader.read() chunks land directly in the result.
+			const source = encryption !== undefined
+				? await this.#decryptStream(encryption)
+				: this.#segments.length === 1
+				? await this.#segments[0].reader.read(
+					this.#segments[0].offset,
+					this.#segments[0].size,
+				)
+				: streamSegments(this.#segments);
+			const result = await read(source, expected);
+			await this.#verifyCrc32([result]);
+			return [result];
 		}
 
+		const source = encryption !== undefined
+			? await this.#decryptStream(encryption)
+			: streamSegments(this.#segments);
 		const chunks: Uint8Array<ArrayBuffer>[] = [];
 		await using reader = new StreamReader(source);
-		await this.#decoder.decode(reader, this.#head.unpackedSize, (chunk) => {
+		await this.#decoder.decode(reader, expected, (chunk) => {
 			chunks.push(chunk);
 		});
+		await this.#verifyCrc32(chunks);
 		return chunks;
 	}
 
