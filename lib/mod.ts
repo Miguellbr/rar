@@ -41,6 +41,8 @@ export { Rar5Entry, unrar5 } from './rar5/extract.ts';
 export type { Rar5VolumeBlock } from './rar5/extract.ts';
 export { walkRar5Archive } from './rar5/extract.ts';
 export { Rar3Entry, unrar3 } from './rar3/extract.ts';
+export type { Rar3VolumeBlock } from './rar3/extract.ts';
+export { walkRar3Archive } from './rar3/extract.ts';
 
 /**
  * extracts entries from a RAR archive, automatically detecting whether it is

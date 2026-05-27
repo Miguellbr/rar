@@ -9,7 +9,7 @@ import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
 import { type DataSegment, deferStream, readBytes, streamSegments } from '../utils/segments.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
 
-import type { UnrarOptions } from '../options.ts';
+import type { UnrarOptions, WalkOptions } from '../options.ts';
 import { fromUint8Array } from '../reader/common.ts';
 import type { Reader } from '../reader/types.ts';
 import type { FileBlock, Rar3Block } from './block.ts';
@@ -50,7 +50,7 @@ const HEADER_PROBE_SIZE = 512;
 /**
  * a parsed block paired with the volume reader it came from.
  */
-export interface VolumeBlock {
+export interface Rar3VolumeBlock {
 	reader: Reader;
 	block: Rar3Block;
 }
@@ -88,7 +88,7 @@ const readHeaderBytes = async (
 
 // walks every block of a single RAR3 volume, yielding each parsed header
 // paired with the reader it came from.
-async function* walkVolume(reader: Reader): AsyncGenerator<VolumeBlock> {
+async function* walkVolume(reader: Reader): AsyncGenerator<Rar3VolumeBlock> {
 	if (reader.length < RAR3_SIGNATURE.length) {
 		throw new TruncatedArchiveError(`not a RAR3 archive: file shorter than the signature`);
 	}
@@ -113,7 +113,7 @@ async function* walkVolume(reader: Reader): AsyncGenerator<VolumeBlock> {
 }
 
 // walks every volume in order, yielding all blocks tagged with their reader.
-async function* walkVolumes(readers: readonly Reader[]): AsyncGenerator<VolumeBlock> {
+async function* walkVolumes(readers: readonly Reader[]): AsyncGenerator<Rar3VolumeBlock> {
 	for (const reader of readers) {
 		yield* walkVolume(reader);
 	}
@@ -436,6 +436,31 @@ const prepareReaders = async (
 	}
 	return out;
 };
+
+/**
+ * walks every parsed block of a RAR3 archive (or multi-volume set), yielding
+ * each block paired with the reader it came from. only header bytes are read;
+ * data areas are skipped, so a listing pass never invokes the decoder.
+ *
+ * volumes whose main header is marked password-protected (hpsw) are slurped
+ * into memory and header-decrypted before walking; unencrypted volumes pass
+ * through with no extra allocation.
+ *
+ * @param source one reader for a single-volume archive, or the ordered set of
+ * volume readers for a multi-volume archive
+ * @param options optional settings such as the password for encrypted headers
+ * @returns async generator yielding every block tagged with its volume reader
+ * @throws if a volume is not a RAR3 archive, has encrypted headers without a
+ * password, or a block header overruns the file
+ */
+export async function* walkRar3Archive(
+	source: Reader | readonly Reader[],
+	options?: WalkOptions,
+): AsyncGenerator<Rar3VolumeBlock> {
+	const inputReaders: readonly Reader[] = Array.isArray(source) ? source : [source];
+	const readers = await prepareReaders(inputReaders, options?.password);
+	yield* walkVolumes(readers);
+}
 
 /**
  * extracts entries from a RAR3 (RAR1.5 - RAR4) archive.

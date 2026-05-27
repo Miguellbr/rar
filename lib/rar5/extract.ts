@@ -244,14 +244,14 @@ async function* walkVolumes(
  * @returns async generator yielding every block, with `block.dataOffset`
  * corrected for the on-disk header frame size
  */
-export const walkRar5Archive = (
+export async function* walkRar5Archive(
 	source: Reader | readonly Reader[],
 	options?: WalkOptions,
-): AsyncGenerator<Rar5VolumeBlock> => {
+): AsyncGenerator<Rar5VolumeBlock> {
 	const readers: readonly Reader[] = Array.isArray(source) ? source : [source];
 	const keys = options?.password !== undefined ? new KeyCache(options.password) : undefined;
-	return walkVolumes(readers, keys);
-};
+	yield* walkVolumes(readers, keys);
+}
 
 /**
  * a single file entry within a RAR5 archive.
