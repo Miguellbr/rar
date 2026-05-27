@@ -213,6 +213,50 @@ Deno.test({
 	},
 });
 
+Deno.test('rar3 extract: password-protected entries decrypt with rar3DeriveKey', async () => {
+	// rar3-comment-psw.rar carries two encrypted file entries — both 0-byte
+	// payloads — alongside their encrypted CMT comment subblocks. extracting
+	// without a password surfaces a clear error; supplying the corpus password
+	// completes the read.
+	const data = Deno.readFileSync(new URL('rar3-comment-psw.rar', FIXTURES_DIR));
+
+	{
+		let threw = false;
+		try {
+			for await (const entry of unrar3(fromUint8Array(data))) {
+				if (entry.isEncrypted) {
+					await entry.bytes();
+				}
+			}
+		} catch (error) {
+			threw = true;
+			if (!(error instanceof Error) || !error.message.includes('password-protected')) {
+				throw new Error(`unexpected error: ${error}`);
+			}
+		}
+		if (!threw) {
+			throw new Error('expected the encrypted entry to refuse extraction without a password');
+		}
+	}
+
+	const sizes: number[] = [];
+	for await (const entry of unrar3(fromUint8Array(data), { password: 'password' })) {
+		if (!entry.isEncrypted) {
+			continue;
+		}
+		const bytes = await entry.bytes();
+		if (bytes.length !== entry.size) {
+			throw new Error(
+				`${entry.filename} read ${bytes.length} bytes, expected ${entry.size}`,
+			);
+		}
+		sizes.push(entry.size);
+	}
+	if (sizes.length === 0) {
+		throw new Error('expected at least one encrypted entry in rar3-comment-psw.rar');
+	}
+});
+
 Deno.test('rar3 extract: PPMd entries throw gracefully', async () => {
 	// unicode.rar uses PPMd-H (not LZSS); listing still works but body reads
 	// surface a "not yet supported" error.

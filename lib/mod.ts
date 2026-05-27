@@ -26,6 +26,7 @@ export { Rar5Entry, unrar5 } from './rar5/extract.ts';
 export type { UnrarOptions, VolumeBlock, WalkOptions } from './rar5/extract.ts';
 export { walkArchive } from './rar5/extract.ts';
 export { Rar3Entry, unrar3 } from './rar3/extract.ts';
+export type { Unrar3Options } from './rar3/extract.ts';
 
 /**
  * extracts entries from a RAR archive, automatically detecting whether it is
@@ -35,8 +36,8 @@ export { Rar3Entry, unrar3 } from './rar3/extract.ts';
  *
  * @param source one reader for a single-volume archive, or the ordered set of
  * volume readers for a multi-volume archive
- * @param options optional settings (currently RAR5-only; ignored when the
- * archive is RAR3)
+ * @param options optional settings; `password` is forwarded to whichever
+ * format handler runs
  * @returns async generator yielding the archive's file entries; the concrete
  * type is {@link Rar5Entry} for RAR5 archives and {@link Rar3Entry} for RAR3
  * @throws if the source does not begin with a known RAR signature
@@ -63,7 +64,7 @@ export async function* unrar(
 		return;
 	}
 	if (matches(probe, RAR3_SIGNATURE)) {
-		yield* unrar3(source);
+		yield* unrar3(source, { password: options?.password });
 		return;
 	}
 

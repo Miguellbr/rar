@@ -6,6 +6,7 @@ import type { Reader } from '../reader/types.ts';
 import type { FileBlock, Rar3Block } from './block.ts';
 import { parseBlock } from './block.ts';
 import { CompressMethod, FileFlag, RAR3_SIGNATURE } from './constants.ts';
+import { decryptRar3Stream } from './crypto.ts';
 import { Rar3Decoder } from './unpack.ts';
 
 /**
@@ -116,15 +117,16 @@ async function* walkVolumes(readers: readonly Reader[]): AsyncGenerator<VolumeBl
  * {@link Rar3Entry.body} or one of the convenience readers is accessed. an
  * entry whose data is split across volumes spans multiple readers internally.
  *
- * compressed entries are exposed in the listing but throw on read; only
- * stored (method 0x30) entries are extractable until the RAR3 decompressor
- * lands.
+ * stored and LZSS-compressed entries (including password-protected ones,
+ * when the caller passes `password` to {@link unrar3}) extract end to end;
+ * PPMd-compressed entries throw at read time pending the PPMd decoder.
  */
 export class Rar3Entry {
 	readonly #head: FileBlock;
 	readonly #segments: DataSegment[];
 	readonly #finalCrc: number;
 	readonly #decoder?: Rar3Decoder;
+	readonly #password?: string;
 
 	#chunks?: Promise<Uint8Array<ArrayBuffer>[]>;
 
@@ -134,11 +136,13 @@ export class Rar3Entry {
 		segments: DataSegment[],
 		finalCrc: number,
 		decoder?: Rar3Decoder,
+		password?: string,
 	) {
 		this.#head = head;
 		this.#segments = segments;
 		this.#finalCrc = finalCrc;
 		this.#decoder = decoder;
+		this.#password = password;
 	}
 
 	/** the entry's path within the archive, with forward slashes as separators. */
@@ -232,22 +236,37 @@ export class Rar3Entry {
 	}
 
 	async #decode(): Promise<Uint8Array<ArrayBuffer>[]> {
-		if (this.isEncrypted) {
+		if (this.isEncrypted && (this.#password === undefined || this.#head.salt === undefined)) {
 			throw new Error(
-				`cannot read ${this.filename}: rar3 password-protected entries are not yet supported`,
+				`cannot read ${this.filename}: rar3 entry is password-protected;` +
+					` pass \`password\` to unrar3 and ensure the header carries a salt`,
 			);
 		}
 
 		const expected = this.#head.unpackedSize;
-		const source = streamSegments(this.#segments);
+		const ciphertext = streamSegments(this.#segments);
+		const source = this.isEncrypted
+			? await decryptRar3Stream(this.#password!, this.#head.salt!, ciphertext)
+			: ciphertext;
 
 		if (this.#head.method === CompressMethod.stored) {
 			// stored: the concatenated segment bytes are the content verbatim.
+			// for encrypted entries, AES-CBC pads the ciphertext up to a 16-byte
+			// boundary so we may receive a few trailing bytes past `expected`;
+			// drop them.
 			const collected: Uint8Array<ArrayBuffer>[] = [];
 			let total = 0;
 			for await (const chunk of source) {
-				collected.push(chunk);
-				total += chunk.length;
+				if (total >= expected) {
+					continue;
+				}
+				if (total + chunk.length > expected) {
+					collected.push(chunk.slice(0, expected - total));
+					total = expected;
+				} else {
+					collected.push(chunk);
+					total += chunk.length;
+				}
 			}
 			if (total !== expected) {
 				throw new Error(
@@ -280,8 +299,9 @@ export class Rar3Entry {
 
 	/**
 	 * a readable stream of the entry's content. unencrypted stored entries
-	 * stream segment by segment without buffering once consumed; subsequent
-	 * consumers replay from a cached copy.
+	 * stream segment by segment without buffering once consumed; encrypted
+	 * and LZSS-compressed entries first materialize through {@link #decode}
+	 * and subsequent consumers replay from a cached copy.
 	 */
 	get body(): ReadableStream<Uint8Array> {
 		// fast path: an unencrypted stored entry that has not yet been consumed
@@ -356,6 +376,12 @@ export class Rar3Entry {
 
 // #region unrar3
 
+/** options for {@link unrar3}. */
+export interface Unrar3Options {
+	/** password for password-protected file entries */
+	password?: string;
+}
+
 /**
  * extracts entries from a RAR3 (RAR1.5 - RAR4) archive.
  *
@@ -367,17 +393,22 @@ export class Rar3Entry {
  *
  * compressed entries flow through the LZSS decoder; PPMd blocks and the VM
  * filter symbol throw at read time, pending implementations of each.
+ * password-protected entries decrypt on read when `options.password` is
+ * supplied.
  *
  * @param source one reader for a single-volume archive, or the ordered set of
  * volume readers for a multi-volume archive
+ * @param options optional settings such as a password for encrypted entries
  * @returns async generator yielding the archive's file entries
  * @throws if a volume is not a RAR3 archive, a header overruns the file, or a
  * split file's continuation is missing
  */
 export async function* unrar3(
 	source: Reader | readonly Reader[],
+	options?: Unrar3Options,
 ): AsyncGenerator<Rar3Entry> {
 	const readers: readonly Reader[] = Array.isArray(source) ? source : [source];
+	const password = options?.password;
 
 	let openHead: FileBlock | undefined;
 	let openSegments: DataSegment[] = [];
@@ -435,23 +466,23 @@ export async function* unrar3(
 			// keep up if a later solid run depends on this entry's bytes — RAR3
 			// does not write stored entries into a solid run, so we can leave
 			// the decoder alone here.
-			entry = new Rar3Entry(head, segments, finalCrc);
+			entry = new Rar3Entry(head, segments, finalCrc, undefined, password);
 		} else if (!solid) {
 			// the head of a (potentially solid) compressed run gets a fresh
 			// decoder; subsequent solid entries reuse it.
 			decoder = new Rar3Decoder(dictSize);
-			entry = new Rar3Entry(head, segments, finalCrc, decoder);
+			entry = new Rar3Entry(head, segments, finalCrc, decoder, password);
 		} else if (decoder !== undefined) {
 			// a solid continuation: the previous entry must finish decoding so
 			// the shared tables and dictionary are in the right state.
 			if (pending !== undefined) {
 				await pending._drain();
 			}
-			entry = new Rar3Entry(head, segments, finalCrc, decoder);
+			entry = new Rar3Entry(head, segments, finalCrc, decoder, password);
 		} else {
 			// solid entry without a preceding run head; report at read time so
 			// callers can choose to skip it without aborting the iteration.
-			entry = new Rar3Entry(head, segments, finalCrc);
+			entry = new Rar3Entry(head, segments, finalCrc, undefined, password);
 		}
 
 		pending = entry;

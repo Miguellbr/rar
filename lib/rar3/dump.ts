@@ -9,17 +9,19 @@
  * the RAR3 dump format differs from RAR5's: blocks use the `FILE:` prefix
  * rather than `R5_FILE:`, flags include the RAR3 file/block names, dictionary
  * size is encoded into the file-flag bits, and the host OS code uses a
- * different numbering. RAR3-style CMT sub-block comments are rendered;
- * RAR1.5/2.x oldComment subblocks, encrypted-data comments, and
- * encrypted-header archives are not yet covered.
+ * different numbering. RAR3-style CMT sub-block comments — including
+ * password-encrypted CMTs when the caller supplies the password — are
+ * rendered; RAR1.5/2.x oldComment subblocks and encrypted-header archives
+ * remain to be covered.
  */
 
-import { concat, decodeUtf8From } from '../utils/buffer.ts';
+import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
 
 import type { DosTime, EndArcBlock, ExtTime, FileBlock, MainBlock } from './block.ts';
 import { walkBlocks } from './block.ts';
 import { CompressMethod, EndArcFlag, FileFlag, HostOs, MainFlag } from './constants.ts';
+import { decryptRar3Stream } from './crypto.ts';
 import { Rar3Decoder } from './unpack.ts';
 
 // #region flag rendering
@@ -271,35 +273,75 @@ const dictionarySizeFromFlags = (fileFlags: number): number => {
 	return (64 * 1024) << (dict >> 5);
 };
 
-// decodes the data area of a CMT sub-record into its plain-text form. only the
-// RAR3 (ver 29) family is handled; encrypted entries, the RAR1.5/2.x LZSS
-// variant, and split CMTs return `undefined` so the caller can omit the
-// comment without aborting the dump.
-const decodeCmtPayload = async (head: FileBlock, data: Uint8Array): Promise<string | undefined> => {
-	if ((head.fileFlags & (FileFlag.password | FileFlag.splitAfter | FileFlag.splitBefore)) !== 0) {
+// wraps a Uint8Array in a single-chunk ReadableStream. the chunk is copied
+// so a caller mutating the source buffer later cannot corrupt the queued
+// chunk (the underlying archive Uint8Array typically outlives the stream).
+const bufferToStream = (
+	data: Uint8Array,
+): ReadableStream<Uint8Array<ArrayBuffer>> => {
+	return new ReadableStream<Uint8Array<ArrayBuffer>>({
+		start(controller) {
+			if (data.length > 0) {
+				controller.enqueue(new Uint8Array(data));
+			}
+			controller.close();
+		},
+	});
+};
+
+// decodes the data area of a CMT sub-record into its plain-text form. handles
+// stored, LZSS-compressed, and password-encrypted RAR3 (ver 29) CMTs. the
+// RAR1.5/2.x LZSS variant, split CMTs, and CMTs missing the required salt
+// are reported as `undefined` so the caller can omit the comment rather
+// than abort the dump.
+const decodeCmtPayload = async (
+	head: FileBlock,
+	data: Uint8Array,
+	password: string | undefined,
+): Promise<string | undefined> => {
+	if ((head.fileFlags & (FileFlag.splitAfter | FileFlag.splitBefore)) !== 0) {
 		return undefined;
 	}
 	if (head.extractVersion < 29) {
 		return undefined;
 	}
 
+	const encrypted = (head.fileFlags & FileFlag.password) !== 0;
+	if (encrypted && (password === undefined || head.salt === undefined)) {
+		return undefined;
+	}
+
+	// resolve the ciphertext stream first: stored data and the LZSS branches
+	// both need to pull from a plaintext stream once decryption is out of the
+	// way. for plain entries this is the source data verbatim.
+	let plaintextStream: ReadableStream<Uint8Array<ArrayBuffer>>;
+	if (encrypted) {
+		try {
+			plaintextStream = await decryptRar3Stream(
+				password!,
+				head.salt!,
+				bufferToStream(data),
+			);
+		} catch {
+			return undefined;
+		}
+	} else {
+		plaintextStream = bufferToStream(data);
+	}
+
 	let bytes: Uint8Array;
 	if (head.method === CompressMethod.stored) {
-		bytes = data.subarray(0, head.unpackedSize);
+		// stored: read up to `unpackedSize` bytes; any trailing AES padding
+		// bytes are encoder noise.
+		try {
+			bytes = await read(plaintextStream, head.unpackedSize);
+		} catch {
+			return undefined;
+		}
 	} else {
 		const decoder = new Rar3Decoder(dictionarySizeFromFlags(head.fileFlags));
-		const source = new ReadableStream<Uint8Array>({
-			start(controller) {
-				if (data.length > 0) {
-					// a fresh ArrayBuffer copy so the queued chunk does not share
-					// memory with the archive buffer the caller still holds.
-					controller.enqueue(new Uint8Array(data));
-				}
-				controller.close();
-			},
-		});
 		const chunks: Uint8Array[] = [];
-		await using reader = new StreamReader(source);
+		await using reader = new StreamReader(plaintextStream);
 		try {
 			await decoder.decode(reader, head.unpackedSize, (chunk) => {
 				chunks.push(chunk);
@@ -391,6 +433,12 @@ const isContinuationVolume = (main: MainBlock, firstFile: FileBlock | undefined)
 	return firstFile !== undefined && (firstFile.fileFlags & FileFlag.splitBefore) !== 0;
 };
 
+/** options recognised by {@link dumpArchive}. */
+export interface DumpOptions {
+	/** password used to decrypt encrypted CMT subblocks */
+	password?: string;
+}
+
 /**
  * dumps a RAR3 (RAR1.5 - RAR4) archive in dumprar's verbosity-1 format.
  *
@@ -398,8 +446,9 @@ const isContinuationVolume = (main: MainBlock, firstFile: FileBlock | undefined)
  * volume buffers to aggregate a split set. file entries dump in archive
  * order; superseded versions and the trailing parts of split files fold into
  * their head per dumprar. RAR3 CMT sub-block comments are surfaced as
- * `comment=...` lines; the RAR1.5/2.x oldComment subblocks, encrypted-data
- * comments, and encrypted-header archives are not yet rendered.
+ * `comment=...` lines, with encrypted comments decrypted on the fly when
+ * `options.password` is supplied. RAR1.5/2.x oldComment subblocks and
+ * encrypted-header archives are not yet rendered.
  *
  * a single buffer that is actually a middle or trailing volume produces
  * dumprar's `--- ... is middle part of multi-vol archive` line so the test
@@ -408,11 +457,14 @@ const isContinuationVolume = (main: MainBlock, firstFile: FileBlock | undefined)
  * @param data the complete archive bytes for one volume, or an ordered list
  * of every volume's bytes
  * @param archivePath path label to print on the leading `Archive:` line
+ * @param options optional settings such as a password for encrypted CMT
+ * comment subblocks
  * @returns the dump text, newline-terminated
  */
 export const dumpArchive = async (
 	data: Uint8Array | readonly Uint8Array[],
 	archivePath: string,
+	options?: DumpOptions,
 ): Promise<string> => {
 	const volumes: readonly Uint8Array[] = Array.isArray(data) ? data : [data as Uint8Array];
 	const isSingleVolume = !Array.isArray(data);
@@ -464,7 +516,7 @@ export const dumpArchive = async (
 			// `undefined` so we silently skip rather than disrupt the dump.
 			if (block.kind === 'sub' && block.name === 'CMT') {
 				const payload = buffer.subarray(block.dataOffset, block.dataOffset + block.dataSize);
-				const text = await decodeCmtPayload(block, payload);
+				const text = await decodeCmtPayload(block, payload, options?.password);
 				if (text !== undefined) {
 					if ((block.fileFlags & FileFlag.solid) !== 0) {
 						const target = entries[entries.length - 1];
