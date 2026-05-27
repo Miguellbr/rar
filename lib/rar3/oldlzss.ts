@@ -16,6 +16,8 @@
  * the implementation is a from-scratch TypeScript port (clean-room).
  */
 
+import { MalformedArchiveError, UnsupportedFeatureError } from '../errors.ts';
+
 // #region bit reader
 
 // MSB-first bit reader. `fgetbits()` returns the next 16 bits without
@@ -644,7 +646,9 @@ const buildHuffmanTable = (lengths: Uint8Array, size: number): HuffmanTable => {
 	for (let idx = 0; idx < size; idx++) {
 		const len = lengths[idx];
 		if (len > MAX_HUFF_LEN) {
-			throw new Error(`rar2 huffman code length ${len} exceeds ${MAX_HUFF_LEN}`);
+			throw new MalformedArchiveError(
+				`RAR2 Huffman code length out of range: ${len} > ${MAX_HUFF_LEN}`,
+			);
 		}
 		counts[len]++;
 	}
@@ -661,7 +665,7 @@ const buildHuffmanTable = (lengths: Uint8Array, size: number): HuffmanTable => {
 		upperLimit <<= 1;
 	}
 	if (upperLimit > 65536) {
-		throw new Error('rar2 over-subscribed huffman table');
+		throw new MalformedArchiveError('over-subscribed RAR2 Huffman table');
 	}
 
 	const symbols = new Uint16Array(size);
@@ -928,7 +932,7 @@ const readTables20 = (state: State20): boolean => {
 	if (audio) {
 		// audio mode is only used for compressed PCM data; comments never carry
 		// audio blocks, so we treat this as malformed.
-		throw new Error('rar2 audio block not supported');
+		throw new UnsupportedFeatureError('RAR2 audio block not supported');
 	}
 	if ((bitField & 0x4000) === 0) {
 		state.unpOldTable.fill(0);

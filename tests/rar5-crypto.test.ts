@@ -1,3 +1,4 @@
+import { MalformedArchiveError } from '../lib/errors.ts';
 import { decryptAesCbc, decryptAesCbcStream, importAesKey } from '../lib/rar5/crypto.ts';
 
 /**
@@ -133,7 +134,7 @@ Deno.test('decryptAesCbcStream: rejects an unaligned final length', async () => 
 		await drain(decryptAesCbcStream(key, iv.slice(), buildStream([bad])));
 	} catch (error) {
 		threw = true;
-		if (!(error instanceof Error) || !error.message.includes('not a multiple of 16')) {
+		if (!(error instanceof MalformedArchiveError)) {
 			throw new Error(`unexpected error: ${error}`);
 		}
 	}

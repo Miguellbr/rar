@@ -1,5 +1,6 @@
 import Queue from '@mary/ds-queue';
 
+import { TruncatedArchiveError } from '../errors.ts';
 import { concat } from './buffer.ts';
 
 export class StreamReader implements AsyncDisposable {
@@ -29,7 +30,9 @@ export class StreamReader implements AsyncDisposable {
 			const { done, value } = await reader.read();
 
 			if (done) {
-				throw new Error(`unexpected end of stream: needed ${size} bytes, have ${this.#buffered}`);
+				throw new TruncatedArchiveError(
+					`unexpected end of stream: needed ${size} bytes, have ${this.#buffered}`,
+				);
 			}
 
 			chunks.enqueue(value);
@@ -44,7 +47,9 @@ export class StreamReader implements AsyncDisposable {
 		}
 
 		if (this.#buffered < size) {
-			throw new Error(`needed ${size} bytes, have ${this.#buffered}`);
+			throw new TruncatedArchiveError(
+				`unexpected end of stream: needed ${size} bytes, have ${this.#buffered}`,
+			);
 		}
 
 		const chunks = this.#chunks;

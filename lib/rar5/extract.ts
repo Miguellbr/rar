@@ -1,3 +1,11 @@
+import {
+	ChecksumMismatchError,
+	InvalidSignatureError,
+	MalformedArchiveError,
+	MissingPasswordError,
+	MissingVolumeError,
+	UnsupportedFeatureError,
+} from '../errors.ts';
 import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
 import { crc32 } from '../utils/crc32.ts';
 import { type DataSegment, deferStream, readBytes, streamSegments } from '../utils/segments.ts';
@@ -57,18 +65,20 @@ const verifyingPassthrough = (
 			if (done) {
 				if (received !== expectedSize) {
 					controller.error(
-						new Error(
-							`${entryName}: stored data is ${received} bytes, expected ${expectedSize}`,
+						new ChecksumMismatchError(
+							`stored data size mismatch: got ${received} bytes, expected ${expectedSize}` +
+								` (entry ${entryName})`,
 						),
 					);
 					return;
 				}
 				if (computed !== expectedCrc) {
 					controller.error(
-						new Error(
-							`crc32 mismatch for ${entryName}: ` +
+						new ChecksumMismatchError(
+							`CRC32 mismatch: ` +
 								`stored 0x${expectedCrc.toString(16).padStart(8, '0')}, ` +
-								`computed 0x${computed.toString(16).padStart(8, '0')}`,
+								`computed 0x${computed.toString(16).padStart(8, '0')}` +
+								` (entry ${entryName})`,
 						),
 					);
 					return;
@@ -165,7 +175,7 @@ async function* walkVolume(
 	const signature = await readBytes(reader, 0, RAR5_SIGNATURE.length);
 	for (let idx = 0; idx < RAR5_SIGNATURE.length; idx++) {
 		if (signature[idx] !== RAR5_SIGNATURE[idx]) {
-			throw new Error(`not a rar5 archive: signature not found`);
+			throw new InvalidSignatureError(`not a RAR5 archive: signature not found`);
 		}
 	}
 
@@ -183,14 +193,14 @@ async function* walkVolume(
 
 		if (block.kind === 'encryption') {
 			if (headerCipher !== undefined) {
-				throw new Error(`unexpected nested encryption header`);
+				throw new MalformedArchiveError(`unexpected nested encryption header`);
 			}
 			if (keys === undefined) {
-				throw new Error(`encrypted archive: a password is required`);
+				throw new MissingPasswordError(`encrypted archive: password required`);
 			}
 			if (block.algorithm !== 0) {
-				throw new Error(
-					`encrypted archive: encryption algorithm ${block.algorithm} is not supported`,
+				throw new UnsupportedFeatureError(
+					`unsupported encryption algorithm: ${block.algorithm}`,
 				);
 			}
 
@@ -478,10 +488,11 @@ export class Rar5Entry {
 		}
 
 		if (expected !== stored) {
-			throw new Error(
-				`crc32 mismatch for ${this.#head.name}: ` +
+			throw new ChecksumMismatchError(
+				`CRC32 mismatch: ` +
 					`stored 0x${stored.toString(16).padStart(8, '0')}, ` +
-					`computed 0x${expected.toString(16).padStart(8, '0')}`,
+					`computed 0x${expected.toString(16).padStart(8, '0')}` +
+					` (entry ${this.#head.name})`,
 			);
 		}
 	}
@@ -493,13 +504,13 @@ export class Rar5Entry {
 		encryption: FileEncryption,
 	): Promise<ReadableStream<Uint8Array<ArrayBuffer>>> {
 		if (this.#keys === undefined) {
-			throw new Error(
-				`cannot read ${this.#head.name}: a password is required for encrypted entries`,
+			throw new MissingPasswordError(
+				`encrypted RAR5 entry: password required (entry ${this.#head.name})`,
 			);
 		}
 		if (encryption.algorithm !== 0) {
-			throw new Error(
-				`cannot read ${this.#head.name}: encryption algorithm ${encryption.algorithm} is not supported`,
+			throw new UnsupportedFeatureError(
+				`unsupported encryption algorithm: ${encryption.algorithm} (entry ${this.#head.name})`,
 			);
 		}
 
@@ -668,17 +679,17 @@ export async function* unrar5(
 
 		if (splitBefore) {
 			if (openHead === undefined || openHead.name !== block.name) {
-				throw new Error(
-					`split continuation for ${block.name} without a preceding head; ` +
-						`the first volume may be missing`,
+				throw new MissingVolumeError(
+					`split continuation without a preceding head: ${block.name}` +
+						` (first volume may be missing)`,
 				);
 			}
 			openSegments.push({ offset: block.dataOffset, reader, size: block.dataSize });
 		} else {
 			if (openHead !== undefined) {
-				throw new Error(
-					`new entry ${block.name} encountered while ${openHead.name} is still split; ` +
-						`a continuation volume may be missing`,
+				throw new MissingVolumeError(
+					`unterminated split entry: ${openHead.name} interrupted by ${block.name}` +
+						` (continuation volume may be missing)`,
 				);
 			}
 			openHead = block;
@@ -727,8 +738,8 @@ export async function* unrar5(
 	}
 
 	if (openHead !== undefined) {
-		throw new Error(
-			`split file ${openHead.name} was not terminated; the final volume may be missing`,
+		throw new MissingVolumeError(
+			`unterminated split entry: ${openHead.name} (final volume may be missing)`,
 		);
 	}
 }

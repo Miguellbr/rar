@@ -12,6 +12,7 @@
  * of RARLAB's unrar.
  */
 
+import { ChecksumMismatchError, MalformedArchiveError, UnsupportedFeatureError } from '../errors.ts';
 import { crc32 } from '../utils/crc32.ts';
 
 import type { StreamReader } from '../utils/stream-reader.ts';
@@ -336,7 +337,9 @@ const createTable = (lengths: Uint8Array, size: number): HuffmanTable => {
 	for (let idx = 0; idx < size; idx++) {
 		const len = lengths[idx];
 		if (len > MAX_SYMBOL_LENGTH) {
-			throw new Error(`rar3 huffman code length ${len} exceeds ${MAX_SYMBOL_LENGTH}`);
+			throw new MalformedArchiveError(
+				`RAR3 Huffman code length out of range: ${len} > ${MAX_SYMBOL_LENGTH}`,
+			);
 		}
 		counts[len]++;
 	}
@@ -353,7 +356,7 @@ const createTable = (lengths: Uint8Array, size: number): HuffmanTable => {
 		upperLimit <<= 1;
 	}
 	if (upperLimit > 65536) {
-		throw new Error('rar3 over-subscribed huffman table');
+		throw new MalformedArchiveError('over-subscribed RAR3 Huffman table');
 	}
 
 	const symbols = new Uint16Array(size);
@@ -469,7 +472,7 @@ const parseCodes = (
 				maxorder = 16 + (maxorder - 16) * 3;
 			}
 			if (maxorder < 2) {
-				throw new Error(`rar3 ppmd maxorder ${maxorder} out of range`);
+				throw new MalformedArchiveError(`RAR3 PPMd max order out of range: ${maxorder}`);
 			}
 			return { escape, init: { dictSize: dictSize!, maxorder }, kind: 'ppmd' };
 		}
@@ -514,7 +517,7 @@ const parseCodes = (
 			idx++;
 		} else if (symbol < 18) {
 			if (idx === 0) {
-				throw new Error('rar3 huffman table repeat with no previous length');
+				throw new MalformedArchiveError('RAR3 Huffman table repeat with no previous length');
 			}
 			const run = symbol === 16 ? bits.read(3) + 3 : bits.read(7) + 11;
 			const prev = lengthTable[idx - 1];
@@ -733,7 +736,9 @@ const parseFilterCommand = async (
 			progIndex = num - 1;
 		}
 		if (progIndex > state.programs.length) {
-			throw new Error(`rar3 filter command references program ${progIndex} past list end`);
+			throw new MalformedArchiveError(
+				`RAR3 filter command references program past list end: ${progIndex}`,
+			);
 		}
 		state.lastFilterNum = progIndex;
 	} else {
@@ -757,8 +762,8 @@ const parseFilterCommand = async (
 	}
 
 	if (blockLength > windowSize || blockLength > VM_MEMORY_SIZE) {
-		throw new Error(
-			`rar3 filter block length ${blockLength} exceeds window (${windowSize}) or VM cap`,
+		throw new MalformedArchiveError(
+			`RAR3 filter block length exceeds window or VM cap: ${blockLength} (window ${windowSize})`,
 		);
 	}
 
@@ -782,7 +787,7 @@ const parseFilterCommand = async (
 	if (prog === undefined) {
 		const len = mbr.number();
 		if (len === 0 || len > 0x10000) {
-			throw new Error(`rar3 filter bytecode length ${len} out of range`);
+			throw new MalformedArchiveError(`RAR3 filter bytecode length out of range: ${len}`);
 		}
 		const bytecode = new Uint8Array(len);
 		for (let idx = 0; idx < len; idx++) {
@@ -795,7 +800,7 @@ const parseFilterCommand = async (
 			xor ^= bytecode[idx];
 		}
 		if (xor !== bytecode[0]) {
-			throw new Error('rar3 filter bytecode XOR checksum mismatch');
+			throw new ChecksumMismatchError('RAR3 filter bytecode XOR checksum mismatch');
 		}
 		prog = { kind: fingerprint(bytecode), oldFilterLength: 0, usageCount: 1 };
 		state.programs[progIndex] = prog;
@@ -830,7 +835,7 @@ const runFilter = (filter: PendingFilter, source: Uint8Array, entryPos: number):
 		case FilterKind.Delta: {
 			const channels = registers[0];
 			if (channels === 0) {
-				throw new Error('rar3 delta filter with zero channels');
+				throw new MalformedArchiveError('RAR3 delta filter with zero channels');
 			}
 			const result = new Uint8Array(blockLength);
 			let srcIdx = 0;
@@ -873,7 +878,7 @@ const runFilter = (filter: PendingFilter, source: Uint8Array, entryPos: number):
 			const stride = registers[0];
 			const byteOffset = registers[1];
 			if (stride === 0 || stride > blockLength || blockLength < 3 || byteOffset > 2) {
-				throw new Error('rar3 rgb filter parameters invalid');
+				throw new MalformedArchiveError('RAR3 RGB filter parameters invalid');
 			}
 			const result = new Uint8Array(blockLength);
 			let src = 0;
@@ -907,7 +912,7 @@ const runFilter = (filter: PendingFilter, source: Uint8Array, entryPos: number):
 		case FilterKind.Audio: {
 			const channels = registers[0];
 			if (channels === 0) {
-				throw new Error('rar3 audio filter with zero channels');
+				throw new MalformedArchiveError('RAR3 audio filter with zero channels');
 			}
 			const result = new Uint8Array(blockLength);
 			let src = 0;
@@ -973,7 +978,7 @@ const runFilter = (filter: PendingFilter, source: Uint8Array, entryPos: number):
 			return result;
 		}
 		case FilterKind.Unknown: {
-			throw new Error('rar3 filter program is not one of the standard set');
+			throw new UnsupportedFeatureError('RAR3 filter program not in the standard set');
 		}
 	}
 };
@@ -1158,9 +1163,7 @@ export class Rar3Decoder {
 		// declared cap), writes won't wrap, so unflushed bytes are safe — set
 		// the threshold past `targetWrite` to disable mid-flushing entirely.
 		const FLUSH_MARGIN = 512;
-		const FLUSH_HIGH_WATER = targetWrite > windowSize
-			? windowSize - FLUSH_MARGIN
-			: unpackedSize + 1;
+		const FLUSH_HIGH_WATER = targetWrite > windowSize ? windowSize - FLUSH_MARGIN : unpackedSize + 1;
 
 		let emitted = startWrite;
 
@@ -1180,7 +1183,9 @@ export class Rar3Decoder {
 					continue;
 				}
 				if (f.blockStart < emitted) {
-					throw new Error('rar3 filter range begins before already-emitted bytes');
+					throw new MalformedArchiveError(
+						'RAR3 filter range begins before already-emitted bytes',
+					);
 				}
 				let source: Uint8Array;
 				if (
@@ -1318,7 +1323,9 @@ export class Rar3Decoder {
 		// command (which would be a malformed archive).
 		const ensureBytesOrThrow = async (count: number): Promise<void> => {
 			if (!await ensureBytes(count)) {
-				throw new Error('rar3 filter command extends past end of compressed data');
+				throw new MalformedArchiveError(
+					'RAR3 filter command extends past end of compressed data',
+				);
 			}
 		};
 
@@ -1328,7 +1335,7 @@ export class Rar3Decoder {
 				// will start cleanly because the bit position is unchanged.
 				return;
 			}
-			throw new Error('rar3 compressed data area is empty');
+			throw new MalformedArchiveError('RAR3 compressed data area is empty');
 		}
 		// at this point `bits` is set; assert for the type checker.
 		const _ = bits!;
@@ -1364,7 +1371,7 @@ export class Rar3Decoder {
 		let endMarkerSeen = false;
 		while (!endMarkerSeen) {
 			if (this.#write > targetWrite) {
-				throw new Error(`rar3 wrote past expected ${unpackedSize} bytes`);
+				throw new ChecksumMismatchError(`RAR3 wrote past expected size: ${unpackedSize} bytes`);
 			}
 
 			// keep at most `windowSize - 512` bytes unflushed so the next
@@ -1387,8 +1394,8 @@ export class Rar3Decoder {
 				} else {
 					this.#tables = undefined;
 					if (mode.init === undefined && this.#ppmd === undefined) {
-						throw new Error(
-							'rar3 ppmd reuse block with no prior model state',
+						throw new MalformedArchiveError(
+							'RAR3 PPMd reuse block with no prior model state',
 						);
 					}
 					// the byte source has to be rebound per block — entry 2 of
@@ -1413,7 +1420,7 @@ export class Rar3Decoder {
 					bits!.alignByte();
 					const model = mode.init !== undefined ? new RAR3PpmdModel(mode.init.dictSize) : this.#ppmd!.model;
 					if (!model.initRangeDecoder(ppmdStream)) {
-						throw new Error('rar3 ppmd range decoder init failed');
+						throw new MalformedArchiveError('RAR3 PPMd range decoder init failed');
 					}
 					if (mode.init !== undefined) {
 						model.initEsc = mode.escape;
@@ -1432,7 +1439,7 @@ export class Rar3Decoder {
 				// with the encoder for the next solid entry.
 				for (;;) {
 					if (this.#write > targetWrite) {
-						throw new Error(`rar3 wrote past expected ${unpackedSize} bytes`);
+						throw new ChecksumMismatchError(`RAR3 wrote past expected size: ${unpackedSize} bytes`);
 					}
 					if (this.#write - emitted >= FLUSH_HIGH_WATER) {
 						await flush(false);
@@ -1440,7 +1447,7 @@ export class Rar3Decoder {
 
 					const sym = model.decodeSymbol();
 					if (sym === PPMD_CORRUPT || sym === PPMD_END_OF_DATA) {
-						throw new Error('rar3 ppmd: decoder reported invalid symbol');
+						throw new MalformedArchiveError('RAR3 PPMd: decoder reported invalid symbol');
 					}
 					if (sym !== escape) {
 						window[this.#write++ & mask] = sym;
@@ -1449,7 +1456,7 @@ export class Rar3Decoder {
 
 					const code = model.decodeSymbol();
 					if (code < 0) {
-						throw new Error('rar3 ppmd: invalid escape code');
+						throw new MalformedArchiveError('RAR3 PPMd: invalid escape code');
 					}
 					if (code === 0) {
 						// in-stream "new table" marker: loop back to parseCodes.
@@ -1466,20 +1473,20 @@ export class Rar3Decoder {
 						break;
 					}
 					if (code === 3) {
-						throw new Error('rar3 ppmd: filter commands are not supported');
+						throw new UnsupportedFeatureError('RAR3 PPMd: filter commands not supported');
 					}
 					if (code === 4) {
 						let lzssOffset = 0;
 						for (let i = 2; i >= 0; i--) {
 							const piece = model.decodeSymbol();
 							if (piece < 0) {
-								throw new Error('rar3 ppmd: truncated offset symbol');
+								throw new MalformedArchiveError('RAR3 PPMd: truncated offset symbol');
 							}
 							lzssOffset |= piece << (i * 8);
 						}
 						const length = model.decodeSymbol();
 						if (length < 0) {
-							throw new Error('rar3 ppmd: truncated length symbol');
+							throw new MalformedArchiveError('RAR3 PPMd: truncated length symbol');
 						}
 						copy(length + 32, lzssOffset + 2);
 						continue;
@@ -1487,7 +1494,7 @@ export class Rar3Decoder {
 					if (code === 5) {
 						const length = model.decodeSymbol();
 						if (length < 0) {
-							throw new Error('rar3 ppmd: truncated repeat length');
+							throw new MalformedArchiveError('RAR3 PPMd: truncated repeat length');
 						}
 						copy(length + 4, 1);
 						continue;
@@ -1527,7 +1534,9 @@ export class Rar3Decoder {
 				// table and keep decoding from the new tables.
 				const refreshed = parseCodes(bits!, this.#lengthTable);
 				if (refreshed.kind !== 'huffman') {
-					throw new Error('rar3 in-stream table refresh switched to ppmd unexpectedly');
+					throw new MalformedArchiveError(
+						'RAR3 in-stream table refresh switched to PPMd unexpectedly',
+					);
 				}
 				this.#tables = refreshed.tables;
 				continue;
@@ -1562,7 +1571,7 @@ export class Rar3Decoder {
 				offs = this.#oldOffsets[offsetIndex];
 				const lengthSymbol = decodeSymbol(tables.length, bits!);
 				if (lengthSymbol >= LENGTH_BASES.length) {
-					throw new Error(`rar3 length symbol ${lengthSymbol} out of range`);
+					throw new MalformedArchiveError(`RAR3 length symbol out of range: ${lengthSymbol}`);
 				}
 				len = LENGTH_BASES[lengthSymbol] + 2;
 				if (LENGTH_EXTRA_BITS[lengthSymbol] > 0) {
@@ -1586,7 +1595,7 @@ export class Rar3Decoder {
 			} else {
 				const lengthSlot = symbol - 271;
 				if (lengthSlot >= LENGTH_BASES.length) {
-					throw new Error(`rar3 main symbol ${symbol} out of length range`);
+					throw new MalformedArchiveError(`RAR3 main symbol out of length range: ${symbol}`);
 				}
 				len = LENGTH_BASES[lengthSlot] + 3;
 				if (LENGTH_EXTRA_BITS[lengthSlot] > 0) {
@@ -1595,7 +1604,7 @@ export class Rar3Decoder {
 
 				const offsetSymbol = decodeSymbol(tables.offset, bits!);
 				if (offsetSymbol >= OFFSET_BASES.length) {
-					throw new Error(`rar3 offset symbol ${offsetSymbol} out of range`);
+					throw new MalformedArchiveError(`RAR3 offset symbol out of range: ${offsetSymbol}`);
 				}
 				offs = OFFSET_BASES[offsetSymbol] + 1;
 				const extraBits = OFFSET_EXTRA_BITS[offsetSymbol];
@@ -1645,13 +1654,13 @@ export class Rar3Decoder {
 		await flush(true);
 
 		if (this.#write < targetWrite) {
-			throw new Error(
-				`rar3 decompressed ${this.#write - startWrite} bytes, expected ${unpackedSize}`,
+			throw new ChecksumMismatchError(
+				`RAR3 decompressed size mismatch: got ${this.#write - startWrite} bytes, expected ${unpackedSize}`,
 			);
 		}
 		if (emitted < targetWrite) {
-			throw new Error(
-				`rar3 pending filter prevents final emission past byte ${emitted - startWrite}`,
+			throw new MalformedArchiveError(
+				`RAR3 pending filter prevents final emission past byte ${emitted - startWrite}`,
 			);
 		}
 	}

@@ -8,6 +8,7 @@
  * format; it does not incorporate code from RARLAB's unrar.
  */
 
+import { ChecksumMismatchError, MalformedArchiveError, UnsupportedFeatureError } from '../errors.ts';
 import type { StreamReader } from '../utils/stream-reader.ts';
 
 // #region constants
@@ -121,7 +122,7 @@ const createDecodeTable = (lengths: Uint8Array, size: number): DecodeTable => {
 	}
 
 	if (upperLimit > 65536) {
-		throw new Error(`over-subscribed huffman table`);
+		throw new MalformedArchiveError(`over-subscribed Huffman table`);
 	}
 
 	const decodeNumber = new Uint16Array(size);
@@ -202,7 +203,7 @@ const parseBlockHeader = (data: Uint8Array, offset: number): BlockHeader => {
 
 	const byteCount = (flags >> 3) & 7;
 	if (byteCount > 2) {
-		throw new Error(`unsupported block header size`);
+		throw new MalformedArchiveError(`invalid block header size: byteCount ${byteCount}`);
 	}
 
 	let blockSize = 0;
@@ -213,7 +214,7 @@ const parseBlockHeader = (data: Uint8Array, offset: number): BlockHeader => {
 	const expected = 0x5a ^ flags ^ (blockSize & 0xff) ^ ((blockSize >> 8) & 0xff) ^
 		((blockSize >> 16) & 0xff);
 	if (expected !== checksum) {
-		throw new Error(`block header checksum mismatch`);
+		throw new ChecksumMismatchError(`block header checksum mismatch`);
 	}
 
 	return {
@@ -293,7 +294,7 @@ const parseTables = (data: Uint8Array, bits: BitReader): Tables => {
 		if (symbol < 18) {
 			// repeat the previous length
 			if (idx === 0) {
-				throw new Error(`huffman table repeat with no previous length`);
+				throw new MalformedArchiveError(`Huffman table repeat with no previous length`);
 			}
 			for (; run > 0 && idx < SIZE_TABLE; run--, idx++) {
 				lengths[idx] = lengths[idx - 1];
@@ -451,7 +452,7 @@ const runFilter = (filter: Filter, window: Uint8Array, mask: number): Uint8Array
 			return out;
 		}
 		default: {
-			throw new Error(`unsupported filter type ${type}`);
+			throw new UnsupportedFeatureError(`unsupported filter type: ${type}`);
 		}
 	}
 };
@@ -566,7 +567,9 @@ export class Rar5Decoder {
 						continue;
 					}
 					if (filter.blockStart < emitted) {
-						throw new Error(`filter range begins before already-emitted bytes`);
+						throw new MalformedArchiveError(
+							`filter range begins before already-emitted bytes`,
+						);
 					}
 					this.#ready.set(filter.blockStart, runFilter(filter, window, mask));
 				}
@@ -672,7 +675,9 @@ export class Rar5Decoder {
 				this.#tables = parseTables(block, bits);
 			}
 			if (this.#tables === undefined) {
-				throw new Error(`block references huffman tables that were never defined`);
+				throw new MalformedArchiveError(
+					`block references Huffman tables that were never defined`,
+				);
 			}
 			const tables = this.#tables;
 
@@ -772,8 +777,8 @@ export class Rar5Decoder {
 			// a filter range so large that it pins emission past the window;
 			// surface it cleanly rather than producing wrong bytes.
 			if (this.#write - emitted > windowSize) {
-				throw new Error(
-					`unemitted bytes (${this.#write - emitted}) exceed window size (${windowSize})`,
+				throw new MalformedArchiveError(
+					`unemitted bytes exceed window size: ${this.#write - emitted} > ${windowSize}`,
 				);
 			}
 
@@ -783,13 +788,17 @@ export class Rar5Decoder {
 		}
 
 		if (this.#write !== targetWrite) {
-			throw new Error(`decompressed ${this.#write - startWrite} bytes, expected ${unpackedSize}`);
+			throw new ChecksumMismatchError(
+				`decompressed size mismatch: got ${this.#write - startWrite} bytes, expected ${unpackedSize}`,
+			);
 		}
 
 		await flush(true);
 
 		if (emitted !== targetWrite) {
-			throw new Error(`pending filter prevents final emission past byte ${emitted - startWrite}`);
+			throw new MalformedArchiveError(
+				`pending filter prevents final emission: stopped at byte ${emitted - startWrite}`,
+			);
 		}
 	}
 }

@@ -26,6 +26,8 @@
  *   UNIT_SIZE = 12 (two CPpmd_States, or one context + 4 bytes of slack).
  */
 
+import { MalformedArchiveError } from '../errors.ts';
+
 // #region constants
 
 const PPMD_INT_BITS = 7;
@@ -275,7 +277,7 @@ export class RAR3PpmdModel {
 	 */
 	constructor(size: number) {
 		if (size < PPMD7_MIN_MEM_SIZE) {
-			throw new Error(`ppmd memory size ${size} is below the 2KiB minimum`);
+			throw new MalformedArchiveError(`PPMd memory size below 2 KiB minimum: ${size}`);
 		}
 		const alignOffset = (4 - (size & 3)) & 3;
 		const totalSize = alignOffset + size + UNIT_SIZE;
@@ -309,7 +311,7 @@ export class RAR3PpmdModel {
 	 */
 	init(maxOrder: number): void {
 		if (maxOrder < PPMD7_MIN_ORDER || maxOrder > PPMD7_MAX_ORDER) {
-			throw new Error(`ppmd max order ${maxOrder} out of range`);
+			throw new MalformedArchiveError(`PPMd max order out of range: ${maxOrder}`);
 		}
 		this.#maxOrder = maxOrder;
 		this.#restartModel();

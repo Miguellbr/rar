@@ -1,3 +1,4 @@
+import { MissingPasswordError, MissingVolumeError } from '../lib/errors.ts';
 import { fromUint8Array } from '../lib/reader/common.ts';
 import { unrar3 } from '../lib/rar3/extract.ts';
 import { crc32 } from '../lib/utils/crc32.ts';
@@ -179,7 +180,7 @@ Deno.test('rar3 extract: rar3-vols rejects a standalone middle volume', async ()
 		}
 	} catch (error) {
 		threw = true;
-		if (!(error instanceof Error) || !error.message.includes('split continuation')) {
+		if (!(error instanceof MissingVolumeError)) {
 			throw new Error(`unexpected error: ${error}`);
 		}
 	}
@@ -232,7 +233,7 @@ Deno.test('rar3 extract: password-protected entries decrypt with rar3DeriveKey',
 			}
 		} catch (error) {
 			threw = true;
-			if (!(error instanceof Error) || !error.message.includes('password-protected')) {
+			if (!(error instanceof MissingPasswordError)) {
 				throw new Error(`unexpected error: ${error}`);
 			}
 		}

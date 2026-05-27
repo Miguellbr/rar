@@ -1,3 +1,4 @@
+import { ChecksumMismatchError, InvalidSignatureError } from '../errors.ts';
 import { textDecoder } from '../utils/buffer.ts';
 import { crc32 } from '../utils/crc32.ts';
 
@@ -476,7 +477,9 @@ export const parseBlock = (header: Uint8Array, headerOffset: number): Rar5Block 
 
 	const computedCrc = crc32(bounded.subarray(4));
 	if (computedCrc !== headerCrc) {
-		throw new Error(`header crc mismatch: expected ${headerCrc}, got ${computedCrc}`);
+		throw new ChecksumMismatchError(
+			`header CRC mismatch: expected ${headerCrc}, got ${computedCrc}`,
+		);
 	}
 
 	const cursor = new Cursor(bounded, sizeCursor.pos);
@@ -564,7 +567,7 @@ export const findSignature = (data: Uint8Array): number => {
 export function* walkBlocks(data: Uint8Array): Generator<Rar5Block> {
 	const start = findSignature(data);
 	if (start === -1) {
-		throw new Error(`not a rar5 archive: signature not found`);
+		throw new InvalidSignatureError(`not a RAR5 archive: signature not found`);
 	}
 
 	let offset = start;

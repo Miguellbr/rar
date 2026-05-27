@@ -1,3 +1,4 @@
+import { InvalidPasswordError, MissingPasswordError, MissingVolumeError } from '../lib/errors.ts';
 import { fromUint8Array } from '../lib/reader/common.ts';
 import { fromFsFile } from '../lib/reader/deno.ts';
 import { unrar5 } from '../lib/rar5/extract.ts';
@@ -121,12 +122,12 @@ Deno.test('rar5 extract: rar5-psw rejects a wrong password', async () => {
 		}
 	} catch (error) {
 		threw = true;
-		if (!(error instanceof Error) || !error.message.includes('check value')) {
+		if (!(error instanceof InvalidPasswordError)) {
 			throw new Error(`unexpected error: ${error}`);
 		}
 	}
 	if (!threw) {
-		throw new Error('expected a check-value error for the wrong password');
+		throw new Error('expected an InvalidPasswordError for the wrong password');
 	}
 });
 
@@ -141,12 +142,12 @@ Deno.test('rar5 extract: rar5-psw rejects a missing password', async () => {
 		}
 	} catch (error) {
 		threw = true;
-		if (!(error instanceof Error) || !error.message.includes('password is required')) {
+		if (!(error instanceof MissingPasswordError)) {
 			throw new Error(`unexpected error: ${error}`);
 		}
 	}
 	if (!threw) {
-		throw new Error('expected a missing-password error');
+		throw new Error('expected a MissingPasswordError');
 	}
 });
 
@@ -190,7 +191,7 @@ Deno.test('rar5 extract: rar5-vols rejects a standalone middle volume', async ()
 		}
 	} catch (error) {
 		threw = true;
-		if (!(error instanceof Error) || !error.message.includes('split continuation')) {
+		if (!(error instanceof MissingVolumeError)) {
 			throw new Error(`unexpected error: ${error}`);
 		}
 	}

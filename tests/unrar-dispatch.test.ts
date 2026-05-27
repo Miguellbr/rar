@@ -1,3 +1,4 @@
+import { InvalidSignatureError, TruncatedArchiveError } from '../lib/errors.ts';
 import { fromUint8Array } from '../lib/reader/common.ts';
 import { Rar3Entry, Rar5Entry, unrar } from '../lib/mod.ts';
 
@@ -52,12 +53,12 @@ Deno.test('unrar: non-RAR source throws', async () => {
 		}
 	} catch (error) {
 		threw = true;
-		if (!(error instanceof Error) || !error.message.includes('RAR signature')) {
+		if (!(error instanceof InvalidSignatureError)) {
 			throw new Error(`unexpected error: ${error}`);
 		}
 	}
 	if (!threw) {
-		throw new Error('expected a signature error');
+		throw new Error('expected an InvalidSignatureError');
 	}
 });
 
@@ -71,11 +72,11 @@ Deno.test('unrar: source shorter than the RAR3 signature throws', async () => {
 		}
 	} catch (error) {
 		threw = true;
-		if (!(error instanceof Error) || !error.message.includes('too short')) {
+		if (!(error instanceof TruncatedArchiveError)) {
 			throw new Error(`unexpected error: ${error}`);
 		}
 	}
 	if (!threw) {
-		throw new Error('expected a too-short error');
+		throw new Error('expected a TruncatedArchiveError');
 	}
 });

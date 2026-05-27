@@ -1,3 +1,5 @@
+import { TruncatedArchiveError } from '../errors.ts';
+
 const fromCharCode = String.fromCharCode;
 
 export const textEncoder = new TextEncoder();
@@ -79,7 +81,7 @@ export async function read(
 			}
 		}
 		if (pos < size) {
-			throw new Error(`unexpected end of stream: expected ${size} bytes, got ${pos}`);
+			throw new TruncatedArchiveError(`unexpected end of stream: expected ${size} bytes, got ${pos}`);
 		}
 		return new Uint8Array(buffer, 0, size);
 	}
@@ -119,7 +121,7 @@ export async function read(
 	}
 
 	if (pos < size) {
-		throw new Error(`unexpected end of stream: expected ${size} bytes, got ${pos}`);
+		throw new TruncatedArchiveError(`unexpected end of stream: expected ${size} bytes, got ${pos}`);
 	}
 
 	return buffer;

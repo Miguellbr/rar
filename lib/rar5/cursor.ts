@@ -1,3 +1,5 @@
+import { MalformedArchiveError } from '../errors.ts';
+
 /**
  * a forward-reading cursor over a byte buffer, providing the primitive reads
  * the RAR5 format is built from: variable-length integers, fixed-width
@@ -60,7 +62,7 @@ export class Cursor {
 
 		for (let count = 0; count < 10; count++) {
 			if (this.#pos >= len) {
-				throw new Error(`vint runs past end of buffer`);
+				throw new MalformedArchiveError(`vint runs past end of buffer`);
 			}
 
 			const byte = data[this.#pos++];
@@ -74,7 +76,7 @@ export class Cursor {
 			scale *= 128;
 		}
 
-		throw new Error(`vint exceeds 10 bytes`);
+		throw new MalformedArchiveError(`vint exceeds 10 bytes`);
 	}
 
 	/**

@@ -7,6 +7,7 @@
  * the AES key.
  */
 
+import { InvalidPasswordError, MalformedArchiveError } from '../errors.ts';
 import { textEncoder } from '../utils/buffer.ts';
 
 /** the three values RAR5 derives from a password, salt, and iteration count. */
@@ -136,14 +137,14 @@ export const importAesKey = (keyBytes: Uint8Array<ArrayBuffer>): Promise<CryptoK
  */
 export const verifyCheckValue = (stored: Uint8Array, derived: Uint8Array): void => {
 	if (stored.length !== derived.length) {
-		throw new Error(`password does not match: check value length differs`);
+		throw new InvalidPasswordError(`password does not match: check value length differs`);
 	}
 	let diff = 0;
 	for (let idx = 0; idx < stored.length; idx++) {
 		diff |= stored[idx] ^ derived[idx];
 	}
 	if (diff !== 0) {
-		throw new Error(`password does not match: check value mismatch`);
+		throw new InvalidPasswordError(`password does not match: check value mismatch`);
 	}
 };
 
@@ -273,7 +274,9 @@ export const decryptAesCbc = async (
 		return new Uint8Array(0);
 	}
 	if ((ciphertext.length & 15) !== 0) {
-		throw new Error(`encrypted data length ${ciphertext.length} is not a multiple of 16`);
+		throw new MalformedArchiveError(
+			`encrypted data length not a multiple of 16: ${ciphertext.length}`,
+		);
 	}
 
 	return await decryptCbcBatch(key, iv, ciphertext);
@@ -360,8 +363,8 @@ export const decryptAesCbcStream = (
 
 			const aligned = sourceDone ? pending.length : pending.length & ~15;
 			if ((aligned & 15) !== 0) {
-				throw new Error(
-					`encrypted data length ${pending.length} is not a multiple of 16`,
+				throw new MalformedArchiveError(
+					`encrypted data length not a multiple of 16: ${pending.length}`,
 				);
 			}
 

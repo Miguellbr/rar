@@ -1,3 +1,4 @@
+import { ReaderError } from '../errors.ts';
 import type { Reader } from './types.ts';
 
 /**
@@ -79,17 +80,17 @@ export async function fromFetch(opts: FetchReaderOptions): Promise<Reader> {
 		// make a HEAD request to get content length upfront
 		const response = await thisFetch(opts.input, { method: 'HEAD' });
 		if (!response.ok) {
-			throw new Error(`failed to fetch resource: http ${response.status}`);
+			throw new ReaderError(`failed to fetch resource: HTTP ${response.status}`);
 		}
 
 		const raw = response.headers.get('content-length');
 		if (raw === null) {
-			throw new Error(`content-length header not available`);
+			throw new ReaderError(`content-length header not available`);
 		}
 
 		const value = parseInt(raw, 10);
 		if (isNaN(value)) {
-			throw new Error(`invalid content-length header`);
+			throw new ReaderError(`invalid content-length header`);
 		}
 
 		return value;
@@ -107,15 +108,17 @@ export async function fromFetch(opts: FetchReaderOptions): Promise<Reader> {
 			const response = await thisFetch(req, { headers });
 
 			if (!response.ok) {
-				throw new Error(`failed to fetch range ${offset}-${endOffset}: http ${response.status}`);
+				throw new ReaderError(
+					`failed to fetch range: HTTP ${response.status} (bytes ${offset}-${endOffset})`,
+				);
 			}
 
 			if (response.status !== 206) {
-				throw new Error(`server does not support range requests`);
+				throw new ReaderError(`server does not support range requests`);
 			}
 
 			if (response.body === null) {
-				throw new Error(`response body is null`);
+				throw new ReaderError(`response body is null`);
 			}
 
 			return response.body;

@@ -11,6 +11,12 @@
  * call — so only the KDF is RAR3-specific here.
  */
 
+import {
+	InvalidSignatureError,
+	MalformedArchiveError,
+	MissingPasswordError,
+	TruncatedArchiveError,
+} from '../errors.ts';
 import { decryptAesCbc, decryptAesCbcStream, importAesKey } from '../rar5/crypto.ts';
 import { BlockFlag, BlockType, MainFlag, RAR3_SIGNATURE } from './constants.ts';
 import { Sha1 } from './sha1.ts';
@@ -148,8 +154,8 @@ export const decryptRar3HeaderStream = async (
 	let offset = encryptedStart;
 	while (offset < archive.length) {
 		if (offset + 8 + 16 > archive.length) {
-			throw new Error(
-				`rar3 encrypted block at 0x${offset.toString(16)} is truncated`,
+			throw new TruncatedArchiveError(
+				`RAR3 encrypted block truncated: at 0x${offset.toString(16)}`,
 			);
 		}
 
@@ -172,8 +178,8 @@ export const decryptRar3HeaderStream = async (
 		const blockFlags = firstPlain[3] | (firstPlain[4] << 8);
 		const headerSize = firstPlain[5] | (firstPlain[6] << 8);
 		if (headerSize < COMMON_HEADER_SIZE) {
-			throw new Error(
-				`rar3 encrypted block at 0x${offset.toString(16)} has invalid headerSize ${headerSize}`,
+			throw new MalformedArchiveError(
+				`invalid RAR3 encrypted header size: ${headerSize} (at 0x${offset.toString(16)})`,
 			);
 		}
 
@@ -183,8 +189,8 @@ export const decryptRar3HeaderStream = async (
 		let addSize = 0;
 		if ((blockFlags & BlockFlag.longBlock) !== 0) {
 			if (firstPlain.length < 11) {
-				throw new Error(
-					`rar3 encrypted block at 0x${offset.toString(16)} truncated before add_size`,
+				throw new TruncatedArchiveError(
+					`RAR3 encrypted block truncated before add_size: at 0x${offset.toString(16)}`,
 				);
 			}
 			addSize = (firstPlain[7] | (firstPlain[8] << 8) | (firstPlain[9] << 16) |
@@ -193,9 +199,10 @@ export const decryptRar3HeaderStream = async (
 
 		const headerCipherLen = Math.ceil(headerSize / 16) * 16;
 		if (offset + 8 + headerCipherLen + addSize > archive.length) {
-			throw new Error(
-				`rar3 encrypted block at 0x${offset.toString(16)} extends past EOF:` +
-					` need ${8 + headerCipherLen + addSize}, have ${archive.length - offset}`,
+			throw new TruncatedArchiveError(
+				`RAR3 encrypted block extends past EOF:` +
+					` need ${8 + headerCipherLen + addSize}, have ${archive.length - offset}` +
+					` (at 0x${offset.toString(16)})`,
 			);
 		}
 
@@ -249,11 +256,11 @@ export const decryptRar3HeaderStream = async (
 // decryptor wants to refuse early when the input clearly isn't RAR3.
 const assertRar3Signature = (archive: Uint8Array): void => {
 	if (archive.length < RAR3_SIGNATURE.length) {
-		throw new Error('rar3 archive shorter than the 7-byte signature');
+		throw new TruncatedArchiveError('RAR3 archive shorter than the 7-byte signature');
 	}
 	for (let idx = 0; idx < RAR3_SIGNATURE.length; idx++) {
 		if (archive[idx] !== RAR3_SIGNATURE[idx]) {
-			throw new Error('not a rar3 archive: signature missing');
+			throw new InvalidSignatureError('not a RAR3 archive: signature not found');
 		}
 	}
 };
@@ -291,7 +298,9 @@ export const decryptRar3HeadersIfNeeded = async (
 		return archive;
 	}
 	if (password === undefined) {
-		throw new Error('rar3 archive has encrypted headers; pass a password to read it');
+		throw new MissingPasswordError(
+			'RAR3 archive has encrypted headers: password required',
+		);
 	}
 	const encryptedStart = mainOffset + mainSize;
 	return await decryptRar3HeaderStream(password, archive, encryptedStart);

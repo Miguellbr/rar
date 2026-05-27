@@ -7,6 +7,12 @@
  * type-specific payload. data follows immediately after the header bytes.
  */
 
+import {
+	ChecksumMismatchError,
+	InvalidSignatureError,
+	MalformedArchiveError,
+	TruncatedArchiveError,
+} from '../errors.ts';
 import { crc32 } from '../utils/crc32.ts';
 import { BlockFlag, BlockType, EndArcFlag, FileFlag, MainFlag, RAR3_SIGNATURE } from './constants.ts';
 
@@ -553,7 +559,7 @@ const parseEndArcBlock = (common: BlockCommon, cursor: Cursor): EndArcBlock => {
  */
 export const parseBlock = (header: Uint8Array, headerOffset: number): Rar3Block => {
 	if (header.length < COMMON_HEADER_SIZE) {
-		throw new Error(`rar3 block header truncated: ${header.length} bytes`);
+		throw new TruncatedArchiveError(`RAR3 block header truncated: ${header.length} bytes`);
 	}
 
 	const cursor = new Cursor(header);
@@ -577,8 +583,8 @@ export const parseBlock = (header: Uint8Array, headerOffset: number): Rar3Block 
 	}
 
 	if (header.length < headerSize) {
-		throw new Error(
-			`rar3 block header truncated: declared ${headerSize} bytes, have ${header.length}`,
+		throw new TruncatedArchiveError(
+			`RAR3 block header truncated: declared ${headerSize} bytes, have ${header.length}`,
 		);
 	}
 
@@ -674,11 +680,12 @@ const verifyHeaderCrc = (
 	const storedCrc = header[0] | (header[1] << 8);
 	const actualCrc = crc32(header.subarray(2, crcEnd)) & 0xffff;
 	if (actualCrc !== storedCrc) {
-		throw new Error(
-			`rar3 block at 0x${headerOffset.toString(16)} header CRC mismatch:` +
+		throw new ChecksumMismatchError(
+			`RAR3 header CRC mismatch:` +
 				` stored 0x${storedCrc.toString(16).padStart(4, '0')},` +
 				` computed 0x${actualCrc.toString(16).padStart(4, '0')}` +
-				` (type=0x${blockType.toString(16)}, range=2..${crcEnd})`,
+				` (at 0x${headerOffset.toString(16)}, type=0x${blockType.toString(16)},` +
+				` range=2..${crcEnd})`,
 		);
 	}
 };
@@ -733,7 +740,7 @@ export const findSignature = (data: Uint8Array): number => {
 export function* walkBlocks(data: Uint8Array): Generator<Rar3Block> {
 	const start = findSignature(data);
 	if (start === -1) {
-		throw new Error(`not a rar3 archive: signature not found`);
+		throw new InvalidSignatureError(`not a RAR3 archive: signature not found`);
 	}
 
 	let offset = start;
@@ -747,14 +754,14 @@ export function* walkBlocks(data: Uint8Array): Generator<Rar3Block> {
 		// on-disk header length for every kind we know about.
 		const headerSize = data[offset + 5] | (data[offset + 6] << 8);
 		if (headerSize < COMMON_HEADER_SIZE) {
-			throw new Error(
-				`rar3 block at 0x${offset.toString(16)} has invalid headerSize ${headerSize}`,
+			throw new MalformedArchiveError(
+				`invalid RAR3 header size: ${headerSize} (at 0x${offset.toString(16)})`,
 			);
 		}
 		if (offset + headerSize > data.length) {
-			throw new Error(
-				`rar3 archive truncated: block at 0x${offset.toString(16)} declares ` +
-					`${headerSize} bytes, ${data.length - offset} available`,
+			throw new TruncatedArchiveError(
+				`RAR3 block truncated: declares ${headerSize} bytes,` +
+					` ${data.length - offset} available (at 0x${offset.toString(16)})`,
 			);
 		}
 

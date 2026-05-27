@@ -12,6 +12,7 @@
  * format and you want the narrower entry type back.
  */
 
+import { InvalidSignatureError, TruncatedArchiveError, UnrarError } from './errors.ts';
 import { read } from './utils/buffer.ts';
 import type { UnrarOptions } from './options.ts';
 import type { Reader } from './reader/types.ts';
@@ -23,6 +24,18 @@ import { RAR5_SIGNATURE } from './rar5/constants.ts';
 export type * from './reader/types.ts';
 export * from './reader/common.ts';
 
+export {
+	ChecksumMismatchError,
+	InvalidPasswordError,
+	InvalidSignatureError,
+	MalformedArchiveError,
+	MissingPasswordError,
+	MissingVolumeError,
+	ReaderError,
+	TruncatedArchiveError,
+	UnrarError,
+	UnsupportedFeatureError,
+} from './errors.ts';
 export type { UnrarOptions } from './options.ts';
 export { Rar5Entry, unrar5 } from './rar5/extract.ts';
 export type { VolumeBlock, WalkOptions } from './rar5/extract.ts';
@@ -49,13 +62,13 @@ export async function* unrar(
 ): AsyncGenerator<Rar5Entry | Rar3Entry> {
 	const readers: readonly Reader[] = Array.isArray(source) ? source : [source];
 	if (readers.length === 0) {
-		throw new Error('unrar: no readers provided');
+		throw new UnrarError('no readers provided');
 	}
 
 	const first = readers[0];
 	const probeLength = Math.min(RAR5_SIGNATURE.length, first.length);
 	if (probeLength < RAR3_SIGNATURE.length) {
-		throw new Error('unrar: source is too short to be a RAR archive');
+		throw new TruncatedArchiveError('source is too short to be a RAR archive');
 	}
 
 	const probe = await read(await first.read(0, probeLength), probeLength);
@@ -69,7 +82,7 @@ export async function* unrar(
 		return;
 	}
 
-	throw new Error('unrar: source does not start with a RAR signature');
+	throw new InvalidSignatureError('source does not start with a RAR signature');
 }
 
 const matches = (probe: Uint8Array, signature: Uint8Array): boolean => {

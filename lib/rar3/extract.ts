@@ -1,3 +1,10 @@
+import {
+	InvalidSignatureError,
+	MalformedArchiveError,
+	MissingPasswordError,
+	MissingVolumeError,
+	TruncatedArchiveError,
+} from '../errors.ts';
 import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
 import { type DataSegment, deferStream, readBytes, streamSegments } from '../utils/segments.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
@@ -58,18 +65,18 @@ const readHeaderBytes = async (
 	const probeLen = Math.min(HEADER_PROBE_SIZE, reader.length - offset);
 	const probe = await readBytes(reader, offset, probeLen);
 	if (probe.length < COMMON_HEADER_SIZE) {
-		throw new Error(`rar3 archive truncated near 0x${offset.toString(16)}`);
+		throw new TruncatedArchiveError(`RAR3 archive truncated: near 0x${offset.toString(16)}`);
 	}
 	const headerSize = probe[5] | (probe[6] << 8);
 	if (headerSize < COMMON_HEADER_SIZE) {
-		throw new Error(
-			`rar3 block at 0x${offset.toString(16)} has invalid headerSize ${headerSize}`,
+		throw new MalformedArchiveError(
+			`invalid RAR3 header size: ${headerSize} (at 0x${offset.toString(16)})`,
 		);
 	}
 	if (offset + headerSize > reader.length) {
-		throw new Error(
-			`rar3 archive truncated: block at 0x${offset.toString(16)} declares ${headerSize}` +
-				` bytes, ${reader.length - offset} available`,
+		throw new TruncatedArchiveError(
+			`RAR3 block truncated: declares ${headerSize} bytes,` +
+				` ${reader.length - offset} available (at 0x${offset.toString(16)})`,
 		);
 	}
 	if (headerSize <= probe.length) {
@@ -83,12 +90,12 @@ const readHeaderBytes = async (
 // paired with the reader it came from.
 async function* walkVolume(reader: Reader): AsyncGenerator<VolumeBlock> {
 	if (reader.length < RAR3_SIGNATURE.length) {
-		throw new Error(`not a rar3 archive: file shorter than the signature`);
+		throw new TruncatedArchiveError(`not a RAR3 archive: file shorter than the signature`);
 	}
 	const signature = await readBytes(reader, 0, RAR3_SIGNATURE.length);
 	for (let idx = 0; idx < RAR3_SIGNATURE.length; idx++) {
 		if (signature[idx] !== RAR3_SIGNATURE[idx]) {
-			throw new Error(`not a rar3 archive: signature not found`);
+			throw new InvalidSignatureError(`not a RAR3 archive: signature not found`);
 		}
 	}
 
@@ -243,9 +250,9 @@ export class Rar3Entry {
 
 	async #decode(): Promise<Uint8Array<ArrayBuffer>[]> {
 		if (this.isEncrypted && (this.#password === undefined || this.#head.salt === undefined)) {
-			throw new Error(
-				`cannot read ${this.filename}: rar3 entry is password-protected;` +
-					` pass \`password\` to unrar3 and ensure the header carries a salt`,
+			throw new MissingPasswordError(
+				`encrypted RAR3 entry: password required` +
+					` (entry ${this.filename}, header must carry a salt)`,
 			);
 		}
 
@@ -280,10 +287,9 @@ export class Rar3Entry {
 			: ciphertext;
 
 		if (this.#decoder === undefined) {
-			throw new Error(
-				`cannot read ${this.filename}: rar3 compression method 0x${
-					this.#head.method.toString(16)
-				} requires a decoder that was not initialized for this entry`,
+			throw new MalformedArchiveError(
+				`solid RAR3 entry has no preceding run head:` +
+					` ${this.filename} (compression method 0x${this.#head.method.toString(16)})`,
 			);
 		}
 
@@ -418,8 +424,8 @@ const prepareReaders = async (
 			continue;
 		}
 		if (password === undefined) {
-			throw new Error(
-				'rar3 archive has encrypted headers; pass `password` to unrar3 to read it',
+			throw new MissingPasswordError(
+				'RAR3 archive has encrypted headers: password required',
 			);
 		}
 		const raw = await slurpReader(reader);
@@ -484,17 +490,17 @@ export async function* unrar3(
 
 		if (splitBefore) {
 			if (openHead === undefined || openHead.name !== block.name) {
-				throw new Error(
-					`split continuation for ${block.name} without a preceding head;` +
-						` the first volume may be missing`,
+				throw new MissingVolumeError(
+					`split continuation without a preceding head: ${block.name}` +
+						` (first volume may be missing)`,
 				);
 			}
 			openSegments.push({ offset: block.dataOffset, reader, size: block.dataSize });
 		} else {
 			if (openHead !== undefined) {
-				throw new Error(
-					`new entry ${block.name} encountered while ${openHead.name} is still split;` +
-						` a continuation volume may be missing`,
+				throw new MissingVolumeError(
+					`unterminated split entry: ${openHead.name} interrupted by ${block.name}` +
+						` (continuation volume may be missing)`,
 				);
 			}
 			openHead = block;
@@ -553,8 +559,8 @@ export async function* unrar3(
 	}
 
 	if (openHead !== undefined) {
-		throw new Error(
-			`split file ${openHead.name} was not terminated; the final volume may be missing`,
+		throw new MissingVolumeError(
+			`unterminated split entry: ${openHead.name} (final volume may be missing)`,
 		);
 	}
 }
