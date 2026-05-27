@@ -259,6 +259,46 @@ Deno.test('rar3 extract: password-protected entries decrypt with rar3DeriveKey',
 	}
 });
 
+Deno.test('rar3 extract: long-password entry exercises rarbug SHA-1 KDF', async () => {
+	// rar3-long-password.rar is built by `scripts/build-rar3-long-password-fixture.ts`
+	// and validated against system unrar. its 32-character password produces a
+	// 66-byte seed, which crosses the rarbug threshold and forces the in-place
+	// SHA-1 corruption that the KDF's key schedule depends on.
+	const fixture = new URL('./fixtures/rar3-long-password.rar', import.meta.url);
+	const data = Deno.readFileSync(fixture);
+	const reader = fromUint8Array(data);
+	const password = 'the-rarbug-makes-this-key-funny!';
+
+	let seen = 0;
+	for await (const entry of unrar3(reader, { password })) {
+		if (entry.isDirectory) {
+			continue;
+		}
+		seen++;
+		if (entry.filename !== 'hello.txt') {
+			throw new Error(`expected hello.txt, got ${entry.filename}`);
+		}
+		const bytes = await entry.bytes();
+		const expected = new TextEncoder().encode('abcdefghijklmnopqrstuvwxyz012345');
+		if (bytes.length !== expected.length) {
+			throw new Error(`read ${bytes.length} bytes, expected ${expected.length}`);
+		}
+		for (let idx = 0; idx < expected.length; idx++) {
+			if (bytes[idx] !== expected[idx]) {
+				throw new Error(`byte ${idx} differs: got 0x${bytes[idx].toString(16)}`);
+			}
+		}
+		if (crc32(bytes) !== entry.crc32) {
+			throw new Error(
+				`crc32 mismatch: data crc 0x${crc32(bytes).toString(16)}, header crc 0x${entry.crc32.toString(16)}`,
+			);
+		}
+	}
+	if (seen !== 1) {
+		throw new Error(`expected one entry, saw ${seen}`);
+	}
+});
+
 Deno.test('rar3 extract: PPMd entries — solid reuse block decodes', async () => {
 	// unicode.rar uses PPMd-H. the first entry's block carries the "full
 	// reinit" flag and decodes end to end. the second entry is a "reuse"

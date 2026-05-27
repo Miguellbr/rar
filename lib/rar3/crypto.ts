@@ -36,12 +36,14 @@ const RAR_MAX_PASSWORD = 127;
  * final digest's first 16 bytes — with each four-byte word byte-swapped
  * from big- to little-endian — is the AES key.
  *
+ * when `seed` is longer than 64 bytes (passwords past 28 characters), each
+ * inner iteration also triggers the RARLAB "rarbug" in-place corruption of
+ * `seed` — see {@link Sha1.updateWithRar3Corruption}. shorter seeds skip
+ * the corruption and behave like standard SHA-1.
+ *
  * @param password the user-supplied password
  * @param salt the 8-byte per-entry salt from the file header
  * @returns the 16-byte AES key and 16-byte CBC IV
- * @throws when the password is so long that the legacy "rarbug" SHA-1 quirk
- * would apply; the corpus we test against never trips this limit, and
- * porting the corruption is deferred until a fixture needs it
  */
 export const rar3DeriveKey = (password: string, salt: Uint8Array): Rar3DerivedKey => {
 	const truncated = password.length > RAR_MAX_PASSWORD ? password.slice(0, RAR_MAX_PASSWORD) : password;
@@ -59,15 +61,6 @@ export const rar3DeriveKey = (password: string, salt: Uint8Array): Rar3DerivedKe
 	seed.set(wstr);
 	seed.set(salt, wstr.length);
 
-	// the "rarbug" SHA-1 only kicks in when one update fills more than a
-	// single 64-byte block. seed itself is the only such update, so for any
-	// seed up to 64 bytes the running SHA-1 is unmodified standard SHA-1.
-	if (seed.length > 64) {
-		throw new Error(
-			'rar3 password longer than 28 characters requires the legacy "rarbug" SHA-1 variant which is not yet implemented',
-		);
-	}
-
 	const sha = new Sha1();
 	const counter = new Uint8Array(3);
 	const iv = new Uint8Array(16);
@@ -79,7 +72,7 @@ export const rar3DeriveKey = (password: string, salt: Uint8Array): Rar3DerivedKe
 			counter[1] = (k >>> 8) & 0xff;
 			counter[2] = (k >>> 16) & 0xff;
 
-			sha.update(seed);
+			sha.updateWithRar3Corruption(seed);
 			sha.update(counter);
 
 			if (j === 0) {

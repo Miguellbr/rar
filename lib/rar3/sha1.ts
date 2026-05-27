@@ -81,6 +81,35 @@ export class Sha1 {
 	}
 
 	/**
+	 * one update plus the RARLAB "rarbug" in-place corruption of `data`. the
+	 * input is hashed normally; afterwards, every full 64-byte block of
+	 * `data` aligned to the running hash's block boundary is overwritten
+	 * with the little-endian packing of `W[64..79]` derived from that
+	 * block's bytes via the standard SHA-1 message-schedule expansion.
+	 *
+	 * the corruption only triggers when `data.length > 64`; shorter inputs
+	 * are hashed and returned unchanged, matching rarfile's `Rar3Sha1`.
+	 * the rar3 KDF re-hashes the same seed buffer many times in a tight
+	 * loop, so the corruption from one iteration leaks into the next —
+	 * that compounding effect is what gives the "rarbug" KDF its
+	 * non-standard output. callers must own `data`; do not pass a view
+	 * aliased to a buffer the caller still needs intact.
+	 *
+	 * @param data the input bytes — mutated in place when the corruption
+	 * window applies. the hash is computed over the *original* bytes.
+	 */
+	updateWithRar3Corruption(data: Uint8Array): void {
+		const bufposBefore = this.#totalLen & 63;
+		this.update(data);
+		if (data.length <= 64) {
+			return;
+		}
+		for (let dpos = 64 - bufposBefore; dpos + 64 <= data.length; dpos += 64) {
+			this.#corruptBlock(data, dpos);
+		}
+	}
+
+	/**
 	 * returns the 20-byte SHA-1 hash of all bytes fed so far. the running
 	 * state is preserved, so subsequent `update` calls behave as if `digest`
 	 * had never been called.
@@ -131,6 +160,32 @@ export class Sha1 {
 		this.#h4 = savedH4;
 
 		return out;
+	}
+
+	// rarbug corruption: reads 16 big-endian u32 from `data[dpos..dpos+64]`,
+	// runs the SHA-1 W expansion 16..79 through the same circular 16-slot
+	// buffer rarfile uses (so the final state is W[64..79] indexed by
+	// `t & 15`), and writes them back as 16 little-endian u32. the
+	// circular-buffer trick is load-bearing; a standard 80-entry W array
+	// would not reproduce rarfile's output.
+	#corruptBlock(data: Uint8Array, dpos: number): void {
+		const ws = new Uint32Array(16);
+		for (let idx = 0; idx < 16; idx++) {
+			const off = dpos + idx * 4;
+			ws[idx] = ((data[off] << 24) | (data[off + 1] << 16) | (data[off + 2] << 8) | data[off + 3]) >>> 0;
+		}
+		for (let t = 16; t < 80; t++) {
+			const tmp = ws[(t - 3) & 15] ^ ws[(t - 8) & 15] ^ ws[(t - 14) & 15] ^ ws[(t - 16) & 15];
+			ws[t & 15] = ((tmp << 1) | (tmp >>> 31)) >>> 0;
+		}
+		for (let idx = 0; idx < 16; idx++) {
+			const word = ws[idx];
+			const off = dpos + idx * 4;
+			data[off + 0] = word & 0xff;
+			data[off + 1] = (word >>> 8) & 0xff;
+			data[off + 2] = (word >>> 16) & 0xff;
+			data[off + 3] = (word >>> 24) & 0xff;
+		}
 	}
 
 	#processBlock(block: Uint8Array, offset: number): void {
