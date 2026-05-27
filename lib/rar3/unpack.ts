@@ -15,6 +15,7 @@
 import { crc32 } from '../utils/crc32.ts';
 
 import type { StreamReader } from '../utils/stream-reader.ts';
+import { PPMD_CORRUPT, PPMD_END_OF_DATA, type PpmdByteIn, RAR3PpmdModel } from './ppmd.ts';
 
 // #region constants
 
@@ -423,6 +424,19 @@ interface Tables {
 	length: HuffmanTable;
 }
 
+// the decision a parseCodes call hands back to the decoder loop: either a
+// fresh set of Huffman tables (LZSS mode) or the parameters needed to
+// initialise or refresh the PPMd-H model.
+type CodeMode =
+	| { kind: 'huffman'; tables: Tables }
+	| {
+		kind: 'ppmd';
+		/** present only on a "full reinit" block; the model is rebuilt with these */
+		init?: { dictSize: number; maxorder: number };
+		/** escape symbol value the decoder loop watches for */
+		escape: number;
+	};
+
 // reads the four Huffman tables that drive the LZSS engine. `lengthtable`
 // carries the per-symbol bit lengths across calls because RAR3 supports a
 // "keep existing tables" mode: a 1 bit means amend the running table by the
@@ -431,15 +445,35 @@ interface Tables {
 const parseCodes = (
 	bits: BitReader,
 	lengthTable: Uint8Array,
-): { ppmd: boolean; tables: Tables } => {
+): CodeMode => {
 	bits.alignByte();
 
 	const ppmd = bits.read(1) !== 0;
 	if (ppmd) {
-		// PPMd-H mode. read the 7-bit ppmd flags so the caller can surface a
-		// meaningful error; we do not yet implement the algorithm.
-		bits.read(7);
-		throw new Error('rar3 ppmd compression is not yet supported');
+		// PPMd-H block — 7 flag bits, then optionally dict size (8 bits) and
+		// escape symbol (8 bits). flag bit 0x20 means "full reinit" (read dict
+		// size + max order); without it we reuse the existing PPMd model but
+		// still reinitialise the range decoder.
+		const flags = bits.read(7);
+		let dictSize: number | undefined;
+		if ((flags & 0x20) !== 0) {
+			dictSize = (bits.read(8) + 1) << 20;
+		}
+		let escape = 2;
+		if ((flags & 0x40) !== 0) {
+			escape = bits.read(8);
+		}
+		if ((flags & 0x20) !== 0) {
+			let maxorder = (flags & 0x1f) + 1;
+			if (maxorder > 16) {
+				maxorder = 16 + (maxorder - 16) * 3;
+			}
+			if (maxorder < 2) {
+				throw new Error(`rar3 ppmd maxorder ${maxorder} out of range`);
+			}
+			return { escape, init: { dictSize: dictSize!, maxorder }, kind: 'ppmd' };
+		}
+		return { escape, kind: 'ppmd' };
 	}
 
 	const keepExisting = bits.read(1) !== 0;
@@ -512,7 +546,7 @@ const parseCodes = (
 		LENGTH_CODE_SIZE,
 	);
 
-	return { ppmd, tables: { length, lowOffset, main, offset } };
+	return { kind: 'huffman', tables: { length, lowOffset, main, offset } };
 };
 
 // #endregion
@@ -987,6 +1021,11 @@ export class Rar3Decoder {
 	#tables?: Tables;
 	/** set when the previous entry left a `start new table` marker in flight. */
 	#startNewTable = true;
+	/**
+	 * PPMd-H state carried across solid-run entries. lifetime mirrors `#tables`
+	 * — re-set at every block boundary based on what `parseCodes` returns.
+	 */
+	#ppmd?: { model: RAR3PpmdModel; escape: number };
 	/** filter program list and pending filter queue, shared across the solid run. */
 	readonly #filterState: Rar3DecoderState = { lastFilterNum: 0, programs: [], stack: [] };
 	/**
@@ -1235,10 +1274,134 @@ export class Rar3Decoder {
 			}
 
 			if (this.#startNewTable) {
-				const { tables } = parseCodes(bits!, this.#lengthTable);
-				this.#tables = tables;
+				const mode = parseCodes(bits!, this.#lengthTable);
+				if (mode.kind === 'huffman') {
+					this.#tables = mode.tables;
+					this.#ppmd = undefined;
+				} else {
+					this.#tables = undefined;
+					if (mode.init === undefined) {
+						// "reuse" PPMd blocks (solid PPMd continuations) require
+						// the model state from the previous entry to match what
+						// the encoder produced. our port reaches the correct
+						// state for entry 1 but diverges before entry 2 — the
+						// underlying mismatch hasn't been pinned down yet, so
+						// we refuse rather than silently emit wrong bytes.
+						throw new Error(
+							'rar3 ppmd: solid (reuse) PPMd blocks are not yet supported',
+						);
+					}
+					// the byte source has to be rebound per block — entry 2 of
+					// a solid run would get its own BitReader, not the one we
+					// built the model with — so the stream object always points
+					// at the current call's bit reader.
+					const ppmdStream: PpmdByteIn = {
+						read: () => {
+							if (bits!.bit !== 0) {
+								bits!.alignByte();
+							}
+							if (bits!.addr >= bits!.data.length - 8) {
+								return 0;
+							}
+							return bits!.read(8);
+						},
+					};
+					// drain whatever's still in flight so the sync PPMd decoder
+					// won't run out of bytes mid-symbol. PPMd archives in the
+					// wild fit comfortably in memory at per-entry granularity.
+					await ensureBytes(1 << 30);
+					bits!.alignByte();
+					const model = new RAR3PpmdModel(mode.init.dictSize);
+					if (!model.initRangeDecoder(ppmdStream)) {
+						throw new Error('rar3 ppmd range decoder init failed');
+					}
+					model.initEsc = mode.escape;
+					model.init(mode.init.maxorder);
+					this.#ppmd = { escape: mode.escape, model };
+				}
 				this.#startNewTable = false;
 			}
+
+			if (this.#ppmd !== undefined) {
+				const { model, escape } = this.#ppmd;
+				// PPMd entries terminate on output size, not on an in-stream
+				// marker: the encoder simply stops feeding the model after
+				// writing `unpackedSize` bytes. when `write` catches up to
+				// `targetWrite` we set `startNewTable` so the next decode call
+				// re-reads the next block's parseCodes flags from the fresh
+				// data area.
+				let restartBlock = false;
+				while (this.#write < targetWrite) {
+					if (this.#write - emitted >= FLUSH_HIGH_WATER) {
+						await flush(false);
+					}
+
+					const sym = model.decodeSymbol();
+					if (sym === PPMD_CORRUPT || sym === PPMD_END_OF_DATA) {
+						throw new Error('rar3 ppmd: decoder reported invalid symbol');
+					}
+					if (sym !== escape) {
+						window[this.#write++ & mask] = sym;
+						continue;
+					}
+
+					const code = model.decodeSymbol();
+					if (code < 0) {
+						throw new Error('rar3 ppmd: invalid escape code');
+					}
+					if (code === 0) {
+						this.#startNewTable = true;
+						restartBlock = true;
+						break;
+					}
+					if (code === 2) {
+						endMarkerSeen = true;
+						break;
+					}
+					if (code === 3) {
+						throw new Error('rar3 ppmd: filter commands are not supported');
+					}
+					if (code === 4) {
+						let lzssOffset = 0;
+						for (let i = 2; i >= 0; i--) {
+							const piece = model.decodeSymbol();
+							if (piece < 0) {
+								throw new Error('rar3 ppmd: truncated offset symbol');
+							}
+							lzssOffset |= piece << (i * 8);
+						}
+						const length = model.decodeSymbol();
+						if (length < 0) {
+							throw new Error('rar3 ppmd: truncated length symbol');
+						}
+						copy(length + 32, lzssOffset + 2);
+						continue;
+					}
+					if (code === 5) {
+						const length = model.decodeSymbol();
+						if (length < 0) {
+							throw new Error('rar3 ppmd: truncated repeat length');
+						}
+						copy(length + 4, 1);
+						continue;
+					}
+					// any other escape code: treat as a literal of the escape value.
+					window[this.#write++ & mask] = sym;
+				}
+
+				if (endMarkerSeen) {
+					break;
+				}
+				if (restartBlock) {
+					// loop back to parseCodes for an in-stream block refresh.
+					continue;
+				}
+				// entry's output budget reached. the next decode() call expects
+				// to read a fresh block header from the next entry's data area.
+				this.#startNewTable = true;
+				break;
+			}
+
 			const tables = this.#tables!;
 
 			const symbol = decodeSymbol(tables.main, bits!);
@@ -1260,8 +1423,11 @@ export class Rar3Decoder {
 				}
 				// in-stream table change: re-parse codes against the same length
 				// table and keep decoding from the new tables.
-				const { tables: refreshed } = parseCodes(bits!, this.#lengthTable);
-				this.#tables = refreshed;
+				const refreshed = parseCodes(bits!, this.#lengthTable);
+				if (refreshed.kind !== 'huffman') {
+					throw new Error('rar3 in-stream table refresh switched to ppmd unexpectedly');
+				}
+				this.#tables = refreshed.tables;
 				continue;
 			}
 

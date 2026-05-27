@@ -260,25 +260,45 @@ Deno.test('rar3 extract: password-protected entries decrypt with rar3DeriveKey',
 	}
 });
 
-Deno.test('rar3 extract: PPMd entries throw gracefully', async () => {
-	// unicode.rar uses PPMd-H (not LZSS); listing still works but body reads
-	// surface a "not yet supported" error.
+Deno.test('rar3 extract: PPMd entries — non-solid decodes; solid throws', async () => {
+	// unicode.rar uses PPMd-H. the first entry's block carries the "full
+	// reinit" flag and decodes end to end. the second entry is a "reuse"
+	// (solid) block that depends on the previous entry's final model state;
+	// our port reaches a state mismatch there and refuses rather than
+	// silently producing wrong bytes.
 	const data = Deno.readFileSync(new URL('unicode.rar', FIXTURES_DIR));
 	const reader = fromUint8Array(data);
 
-	let threw = false;
-	try {
-		for await (const entry of unrar3(reader)) {
-			if (entry.isDirectory || entry.compressionMethod === 0x30) continue;
-			await entry.bytes();
+	let firstBytes: Uint8Array | undefined;
+	let solidErr: Error | undefined;
+	let idx = 0;
+	for await (const entry of unrar3(reader)) {
+		if (entry.isDirectory || entry.compressionMethod === 0x30) {
+			idx++;
+			continue;
 		}
-	} catch (error) {
-		threw = true;
-		if (!(error instanceof Error) || !error.message.includes('ppmd')) {
-			throw new Error(`unexpected error: ${error}`);
+		if (idx === 0) {
+			firstBytes = await entry.bytes();
+		} else {
+			try {
+				await entry.bytes();
+			} catch (err) {
+				solidErr = err as Error;
+			}
 		}
+		idx++;
 	}
-	if (!threw) {
-		throw new Error('expected a "ppmd" error');
+
+	if (
+		firstBytes === undefined || firstBytes.length !== 2 || firstBytes[0] !== 0x31 || firstBytes[1] !== 0x0a
+	) {
+		throw new Error(
+			`expected first PPMd entry to decode to "1\\n", got ${
+				firstBytes ? JSON.stringify(Array.from(firstBytes)) : 'undefined'
+			}`,
+		);
+	}
+	if (solidErr === undefined || !solidErr.message.includes('solid')) {
+		throw new Error(`expected a "solid ppmd" error for the second entry, got ${solidErr}`);
 	}
 });
