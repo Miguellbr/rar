@@ -258,7 +258,7 @@ export async function* walkRar5Archive(
  *
  * metadata is available immediately; the entry's content is read lazily from
  * the archive when {@link Rar5Entry.body} or one of the convenience readers is
- * accessed. an entry that belongs to a solid run shares its decompression
+ * consumed. an entry that belongs to a solid run shares its decompression
  * state with the entries preceding it, and an entry whose data is split
  * across volumes spans multiple readers internally; the {@link unrar5}
  * iterator drives both kinds of coordination so callers can simply consume
@@ -520,10 +520,12 @@ export class Rar5Entry {
 	}
 
 	/**
-	 * a readable stream of the entry's decompressed content. for an unencrypted
-	 * stored entry that has not yet been consumed elsewhere, segments stream
-	 * directly without buffering; otherwise the single decode pass runs and its
-	 * chunks are emitted in order.
+	 * a readable stream of the entry's decompressed content. decoding (or any
+	 * underlying read) is deferred until the stream is pulled, so an unconsumed
+	 * access does no I/O. for an unencrypted stored entry that has not yet been
+	 * consumed elsewhere, segments stream directly without buffering; otherwise
+	 * the single decode pass runs on first pull and its chunks are emitted in
+	 * order.
 	 * @returns a stream of the entry data
 	 */
 	get body(): ReadableStream<Uint8Array> {

@@ -37,9 +37,11 @@ export const readBytes = async (
 
 /**
  * adapts a lazily-opened stream into one that can be returned synchronously.
- * the cancellation flag handles the race where cancel arrives before the
- * `open` callback resolves: without it, the freshly-opened inner stream would
- * be assigned onto an already-cancelled outer stream and leak its reader.
+ * `open` runs on the first pull, not at construction, so a stream that is
+ * never consumed never triggers the decode or I/O work behind it. the
+ * cancellation flag handles the race where cancel arrives before the `open`
+ * callback resolves: without it, the freshly-opened inner stream would be
+ * assigned onto an already-cancelled outer stream and leak its reader.
  *
  * @param open invoked once on first pull to produce the inner stream
  * @returns a ReadableStream that delegates to `open()`'s result
@@ -48,23 +50,33 @@ export const deferStream = (
 	open: () => Promise<ReadableStream<Uint8Array>>,
 ): ReadableStream<Uint8Array> => {
 	let inner: ReadableStreamDefaultReader<Uint8Array> | undefined;
+	let opening: Promise<void> | undefined;
 	let cancelled = false;
 	let cancelReason: unknown;
 
+	const ensureOpen = (): Promise<void> => {
+		if (opening !== undefined) {
+			return opening;
+		}
+		opening = (async () => {
+			const stream = await open();
+			if (cancelled) {
+				await stream.cancel(cancelReason);
+				return;
+			}
+			inner = stream.getReader();
+		})();
+		return opening;
+	};
+
 	return new ReadableStream({
-		async start(controller) {
+		async pull(controller) {
 			try {
-				const stream = await open();
-				if (cancelled) {
-					await stream.cancel(cancelReason);
-					return;
-				}
-				inner = stream.getReader();
+				await ensureOpen();
 			} catch (error) {
 				controller.error(error);
+				return;
 			}
-		},
-		async pull(controller) {
 			if (inner === undefined) {
 				controller.close();
 				return;

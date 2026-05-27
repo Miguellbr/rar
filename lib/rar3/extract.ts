@@ -127,7 +127,7 @@ async function* walkVolumes(readers: readonly Reader[]): AsyncGenerator<Rar3Volu
  * a single file entry within a RAR3 archive.
  *
  * metadata is available immediately; the entry's content is read lazily when
- * {@link Rar3Entry.body} or one of the convenience readers is accessed. an
+ * {@link Rar3Entry.body} or one of the convenience readers is consumed. an
  * entry whose data is split across volumes spans multiple readers internally.
  *
  * stored and LZSS-compressed entries (including password-protected ones,
@@ -307,10 +307,12 @@ export class Rar3Entry {
 	}
 
 	/**
-	 * a readable stream of the entry's content. unencrypted stored entries
-	 * stream segment by segment without buffering once consumed; encrypted
-	 * and LZSS-compressed entries first materialize through {@link #decode}
-	 * and subsequent consumers replay from a cached copy.
+	 * a readable stream of the entry's content. decoding (or any underlying
+	 * read) is deferred until the stream is pulled, so an unconsumed access
+	 * does no I/O. unencrypted stored entries stream segment by segment without
+	 * buffering once pulled; encrypted and LZSS-compressed entries first
+	 * materialize through {@link #decode} and subsequent consumers replay from
+	 * a cached copy.
 	 */
 	get body(): ReadableStream<Uint8Array> {
 		// fast path: an unencrypted stored entry that has not yet been consumed
