@@ -17,10 +17,6 @@ const CORPUS_PASSWORD = 'password';
 
 const SKIP: Record<string, string> = {
 	'ctime5.rar': 'actually a RAR5 archive (signature ends in 0x01); belongs to the RAR5 corpus',
-	'rar15-comment-lock.rar': 'RAR1.5 oldComment subblock; needs the v15/v20 LZSS decoder',
-	'rar15-comment.rar': 'RAR1.5 oldComment subblock; needs the v15/v20 LZSS decoder',
-	'rar202-comment-nopsw.rar': 'RAR2.0.2 oldComment subblock; needs the v15/v20 LZSS decoder',
-	'rar202-comment-psw.rar': 'RAR2.0.2 encrypted oldComment; needs v15/v20 LZSS + RAR3 file encryption',
 	'rar3-old.r00': 'no golden file; rendered through rar3-old.rar as its first volume',
 	'rar3-old.r01': 'no golden file; rendered through rar3-old.rar as its first volume',
 };

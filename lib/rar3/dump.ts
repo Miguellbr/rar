@@ -11,9 +11,8 @@
  * size is encoded into the file-flag bits, and the host OS code uses a
  * different numbering. RAR3-style CMT sub-block comments — including
  * password-encrypted CMTs when the caller supplies the password — and
- * RAR1.5/2.x oldComment subblocks (stored variant only) are rendered as
- * `comment=...` lines. compressed oldComments (v15/v20 LZSS) still drop
- * through and are silently omitted.
+ * RAR1.5/2.x oldComment subblocks (stored and compressed) are rendered as
+ * `comment=...` lines.
  */
 
 import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
@@ -23,6 +22,7 @@ import type { DosTime, EndArcBlock, ExtTime, FileBlock, MainBlock, OldCommentSub
 import { walkBlocks } from './block.ts';
 import { CompressMethod, EndArcFlag, FileFlag, HostOs, MainFlag } from './constants.ts';
 import { decryptRar3HeadersIfNeeded, decryptRar3Stream } from './crypto.ts';
+import { decodeOldLzss15, decodeOldLzss20 } from './oldlzss.ts';
 import { Rar3Decoder } from './unpack.ts';
 
 // #region flag rendering
@@ -292,18 +292,25 @@ const bufferToStream = (
 
 // decodes a legacy oldComment subblock embedded inline in a MAIN or FILE
 // header. stored (`meth=0x30`) data is returned verbatim. compressed
-// variants (the v15/v20 LZSS encoder used by RAR1.5/2.x) are not yet
-// implemented and return `undefined` so the caller can omit the comment
-// rather than abort the dump.
+// variants are routed through the v15 or v20 LZSS decoder based on the
+// `version` field. anything else returns `undefined` so the caller can omit
+// the comment rather than abort the dump.
 const decodeOldComment = (sub: OldCommentSubBlock): string | undefined => {
-	if (sub.method !== CompressMethod.stored) {
-		return undefined;
+	let bytes: Uint8Array | undefined;
+	if (sub.method === CompressMethod.stored) {
+		if (sub.data.length < sub.decompressedSize) {
+			return undefined;
+		}
+		bytes = sub.data.subarray(0, sub.decompressedSize);
+	} else if (sub.version <= 15) {
+		bytes = decodeOldLzss15(sub.data, sub.decompressedSize);
+	} else if (sub.version <= 20 || sub.version === 26) {
+		bytes = decodeOldLzss20(sub.data, sub.decompressedSize);
 	}
-	if (sub.data.length < sub.decompressedSize) {
+	if (bytes === undefined) {
 		return undefined;
 	}
 
-	const bytes = sub.data.subarray(0, sub.decompressedSize);
 	try {
 		return decodeUtf8From(bytes as Uint8Array<ArrayBuffer>);
 	} catch {
@@ -469,8 +476,9 @@ export interface DumpOptions {
  * order; superseded versions and the trailing parts of split files fold into
  * their head per dumprar. RAR3 CMT sub-block comments are surfaced as
  * `comment=...` lines, with encrypted comments decrypted on the fly when
- * `options.password` is supplied. RAR1.5/2.x oldComment subblocks render
- * the stored variant; compressed v15/v20 LZSS comments are still skipped.
+ * `options.password` is supplied. RAR1.5/2.x oldComment subblocks decode
+ * through the v15/v20 LZSS decoders in {@link decodeOldLzss15}/
+ * {@link decodeOldLzss20}.
  *
  * a single buffer that is actually a middle or trailing volume produces
  * dumprar's `--- ... is middle part of multi-vol archive` line so the test
