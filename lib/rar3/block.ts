@@ -7,7 +7,8 @@
  * type-specific payload. data follows immediately after the header bytes.
  */
 
-import { BlockFlag, BlockType, EndArcFlag, FileFlag, RAR3_SIGNATURE } from './constants.ts';
+import { crc32 } from '../utils/crc32.ts';
+import { BlockFlag, BlockType, EndArcFlag, FileFlag, MainFlag, RAR3_SIGNATURE } from './constants.ts';
 
 // #region cursor
 
@@ -455,16 +456,17 @@ const parseEndArcBlock = (common: BlockCommon, cursor: Cursor): EndArcBlock => {
  * its `add_size` u32 (i.e. the bytes from `headerOffset` through the end of
  * the cleartext header).
  *
- * the header CRC16 is intentionally not verified here: its on-disk coverage
- * range varies by block type (main and file headers exclude their trailing
- * sub-block area, while sub and endArc cover the whole header), and the
- * dumprar-style consumer needs the parsed fields regardless. data integrity
- * is anchored by each file block's `crc` field over the file payload.
+ * the 2-byte header CRC is verified after parsing. its coverage range varies
+ * by block type: main and file headers exclude their trailing comment
+ * sub-block area, sub and endArc cover the whole header. the legacy
+ * oldSub (0x77) block additionally extends CRC coverage over its data area;
+ * none of our fixtures carry one, so the verification is skipped there.
  *
  * @param header the complete header bytes
  * @param headerOffset absolute offset of the header within the archive
  * @returns the parsed block
- * @throws if the header is too small for the declared `headerSize`
+ * @throws if the header is too small for the declared `headerSize`, or its
+ * stored CRC does not match the bytes it covers
  */
 export const parseBlock = (header: Uint8Array, headerOffset: number): Rar3Block => {
 	if (header.length < COMMON_HEADER_SIZE) {
@@ -517,22 +519,84 @@ export const parseBlock = (header: Uint8Array, headerOffset: number): Rar3Block 
 		headerSize,
 	};
 
+	let block: Rar3Block;
 	switch (blockType) {
 		case BlockType.main: {
-			return parseMainBlock(common);
+			block = parseMainBlock(common);
+			break;
 		}
 		case BlockType.file: {
-			return parseFileLikeBlock('file', common, cursor);
+			block = parseFileLikeBlock('file', common, cursor);
+			break;
 		}
 		case BlockType.sub: {
-			return parseFileLikeBlock('sub', common, cursor);
+			block = parseFileLikeBlock('sub', common, cursor);
+			break;
 		}
 		case BlockType.endArc: {
-			return parseEndArcBlock(common, cursor);
+			block = parseEndArcBlock(common, cursor);
+			break;
 		}
 		default: {
-			return { ...common, blockType, kind: 'unknown' };
+			block = { ...common, blockType, kind: 'unknown' };
 		}
+	}
+
+	verifyHeaderCrc(header, blockType, blockFlags, longBlock, cursor.pos, headerSize, headerOffset);
+	return block;
+};
+
+// computes how many bytes from the start of the header the CRC covers, then
+// checks the stored CRC16 against `crc32(coverage) & 0xffff`. coverage rules
+// follow rarfile's parser: MAIN goes through the fixed header (6 reserved
+// bytes plus 1 for ENCRYPTVER) but excludes any trailing comment subblock;
+// FILE/SUB stop at the end of the parsed file-header fields (which already
+// excludes the optional comment subblock that follows when FileFlag.comment
+// is set); other block kinds cover the entire declared header.
+const verifyHeaderCrc = (
+	header: Uint8Array,
+	blockType: number,
+	blockFlags: number,
+	longBlock: boolean,
+	cursorEnd: number,
+	headerSize: number,
+	headerOffset: number,
+): void => {
+	// the legacy oldSub block (RAR1.5) folds its data area into the CRC range
+	// and we never see one in the corpus; skip the check rather than fail
+	// loudly on a hypothetical archive that carries one.
+	if (blockType === BlockType.oldSub) {
+		return;
+	}
+
+	let crcEnd: number;
+	if (blockType === BlockType.main) {
+		crcEnd = COMMON_HEADER_SIZE + (longBlock ? 4 : 0) + 6;
+		if ((blockFlags & MainFlag.encryptVer) !== 0) {
+			crcEnd += 1;
+		}
+	} else if (blockType === BlockType.file) {
+		// FILE crc_pos excludes the trailing comment subblock area, so it ends
+		// where the parsed file-header fields stop (matching rarfile's
+		// `_parse_file_header` return value).
+		crcEnd = cursorEnd;
+	} else {
+		// SUB and the rest (endArc, unknown, legacy) cover the whole declared
+		// header. SUB blocks carry per-record fields after the file-header
+		// section (owner UID/GID, ACL bytes, etc.) that the generic file parse
+		// doesn't enumerate; CRC always runs over the declared headerSize.
+		crcEnd = headerSize;
+	}
+
+	const storedCrc = header[0] | (header[1] << 8);
+	const actualCrc = crc32(header.subarray(2, crcEnd)) & 0xffff;
+	if (actualCrc !== storedCrc) {
+		throw new Error(
+			`rar3 block at 0x${headerOffset.toString(16)} header CRC mismatch:` +
+				` stored 0x${storedCrc.toString(16).padStart(4, '0')},` +
+				` computed 0x${actualCrc.toString(16).padStart(4, '0')}` +
+				` (type=0x${blockType.toString(16)}, range=2..${crcEnd})`,
+		);
 	}
 };
 
