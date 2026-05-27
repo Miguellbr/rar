@@ -1053,6 +1053,35 @@ export class Rar3Decoder {
 		this.#window = new Uint8Array(windowSize);
 	}
 
+	/** size of the LZSS dictionary window this decoder was sized for. */
+	get windowSize(): number {
+		return this.#windowSize;
+	}
+
+	/**
+	 * resets the carry-over state so this decoder can be driven for a fresh
+	 * non-solid entry without reallocating the multi-megabyte window. clears
+	 * write position, distance cache, Huffman tables, PPMd state, and filter
+	 * queue; the window bytes themselves are left intact (LZ matches can only
+	 * reference positions in `[0, write)`, so stale bytes are unreachable).
+	 */
+	reset(): void {
+		this.#oldOffsets = [0, 0, 0, 0];
+		this.#lastOffset = 0;
+		this.#lastLength = 0;
+		this.#lastLowOffset = 0;
+		this.#lowOffsetRepeats = 0;
+		this.#write = 0;
+		this.#lengthTable.fill(0);
+		this.#tables = undefined;
+		this.#startNewTable = true;
+		this.#ppmd = undefined;
+		this.#filterState.lastFilterNum = 0;
+		this.#filterState.programs.length = 0;
+		this.#filterState.stack.length = 0;
+		this.#ready.clear();
+	}
+
 	/**
 	 * decodes the data area of one RAR3 file entry, appending its bytes to the
 	 * shared window and emitting decoded chunks to `sink` as they settle.

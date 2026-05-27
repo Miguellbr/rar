@@ -523,9 +523,17 @@ export async function* unrar3(
 			// the decoder alone here.
 			entry = new Rar3Entry(head, segments, finalCrc, undefined, password);
 		} else if (!solid) {
-			// the head of a (potentially solid) compressed run gets a fresh
-			// decoder; subsequent solid entries reuse it.
-			decoder = new Rar3Decoder(dictSize);
+			// the head of a (potentially solid) compressed run; subsequent
+			// solid entries reuse the decoder. when the previous run's
+			// decoder already owns a window large enough for this entry we
+			// reset its state in place — the (1-4 MiB) window allocation
+			// dominates the cost of decoding small entries in archives that
+			// share a dict size across many file headers.
+			if (decoder !== undefined && decoder.windowSize >= dictSize) {
+				decoder.reset();
+			} else {
+				decoder = new Rar3Decoder(dictSize);
+			}
 			entry = new Rar3Entry(head, segments, finalCrc, decoder, password);
 		} else if (decoder !== undefined) {
 			// a solid continuation: the previous entry must finish decoding so

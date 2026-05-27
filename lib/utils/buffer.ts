@@ -37,11 +37,21 @@ export async function read(
 	// pre-allocated buffer with no producer-side memcpy. Web Crypto pipes
 	// (decrypt streams) and user-supplied non-byte sources don't support
 	// BYOB; fall back to the default-reader copy loop when getReader throws.
+	//
+	// the BYOB reader setup (and the TypeError throw when the stream isn't
+	// byte-typed) carries ~µs of fixed overhead. for tiny reads — header
+	// probes, signature checks, etc. — that swamps the per-byte savings, so
+	// only attempt BYOB once the request is large enough to amortize the
+	// setup. the threshold is empirical: profiling many small reads through
+	// a non-byte stream (fromUint8Array) showed BYOB-setup-and-throw as
+	// double-digit percent of total time on the in-memory LZSS bench.
 	let byob: ReadableStreamBYOBReader | undefined;
-	try {
-		byob = stream.getReader({ mode: 'byob' });
-	} catch {
-		// fall through to default-reader path below
+	if (size >= 4096) {
+		try {
+			byob = stream.getReader({ mode: 'byob' });
+		} catch {
+			// fall through to default-reader path below
+		}
 	}
 
 	if (byob !== undefined) {
