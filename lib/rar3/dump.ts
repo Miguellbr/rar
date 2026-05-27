@@ -9,13 +9,18 @@
  * the RAR3 dump format differs from RAR5's: blocks use the `FILE:` prefix
  * rather than `R5_FILE:`, flags include the RAR3 file/block names, dictionary
  * size is encoded into the file-flag bits, and the host OS code uses a
- * different numbering. comments, multi-volume aggregation, and the
- * encrypted-header variants are not yet rendered.
+ * different numbering. RAR3-style CMT sub-block comments are rendered;
+ * RAR1.5/2.x oldComment subblocks, encrypted-data comments, and
+ * encrypted-header archives are not yet covered.
  */
+
+import { concat, decodeUtf8From } from '../utils/buffer.ts';
+import { StreamReader } from '../utils/stream-reader.ts';
 
 import type { DosTime, EndArcBlock, ExtTime, FileBlock, MainBlock } from './block.ts';
 import { walkBlocks } from './block.ts';
-import { EndArcFlag, FileFlag, HostOs, MainFlag } from './constants.ts';
+import { CompressMethod, EndArcFlag, FileFlag, HostOs, MainFlag } from './constants.ts';
+import { Rar3Decoder } from './unpack.ts';
 
 // #region flag rendering
 
@@ -216,13 +221,101 @@ const normalizeName = (name: string): string => name.replaceAll('\\', '/');
 
 // the per-file dump state carried across a multi-volume walk: the head's
 // metadata lives in `head`, while the volume index and split-aware totals
-// settle as later parts are seen.
+// settle as later parts are seen. an entry-level CMT subblock that follows
+// the file folds its decoded text into `comment`.
 interface AggregatedFile {
 	head: FileBlock;
 	compressedSize: number;
 	crc: number;
 	volume: number;
+	comment?: string;
 }
+
+// formats a string the way python's `repr` would print it: wrapped in single
+// quotes (or double quotes when the string contains a single quote but no
+// double quote), with the standard `\`, `\n`, `\r`, `\t` and `\xHH` escapes.
+// matches what rarfile's dumprar emits for `comment=...` lines.
+const pythonRepr = (text: string): string => {
+	const useDouble = text.includes("'") && !text.includes('"');
+	const quote = useDouble ? '"' : "'";
+	let out = quote;
+	for (const ch of text) {
+		const code = ch.codePointAt(0)!;
+		if (ch === '\\') {
+			out += '\\\\';
+		} else if (ch === quote) {
+			out += '\\' + quote;
+		} else if (ch === '\n') {
+			out += '\\n';
+		} else if (ch === '\r') {
+			out += '\\r';
+		} else if (ch === '\t') {
+			out += '\\t';
+		} else if (code < 0x20 || code === 0x7f) {
+			out += '\\x' + code.toString(16).padStart(2, '0');
+		} else {
+			out += ch;
+		}
+	}
+	return out + quote;
+};
+
+// the dictionary size (in bytes) implied by a file/sub header's flag bits.
+// the dict-mask carries a 3-bit code that the LZSS engine rounds up to the
+// next power of two; the "directory" code degenerates to the smallest window.
+const dictionarySizeFromFlags = (fileFlags: number): number => {
+	const dict = fileFlags & FileFlag.dictMask;
+	if (dict === FileFlag.directory) {
+		return 64 * 1024;
+	}
+	return (64 * 1024) << (dict >> 5);
+};
+
+// decodes the data area of a CMT sub-record into its plain-text form. only the
+// RAR3 (ver 29) family is handled; encrypted entries, the RAR1.5/2.x LZSS
+// variant, and split CMTs return `undefined` so the caller can omit the
+// comment without aborting the dump.
+const decodeCmtPayload = async (head: FileBlock, data: Uint8Array): Promise<string | undefined> => {
+	if ((head.fileFlags & (FileFlag.password | FileFlag.splitAfter | FileFlag.splitBefore)) !== 0) {
+		return undefined;
+	}
+	if (head.extractVersion < 29) {
+		return undefined;
+	}
+
+	let bytes: Uint8Array;
+	if (head.method === CompressMethod.stored) {
+		bytes = data.subarray(0, head.unpackedSize);
+	} else {
+		const decoder = new Rar3Decoder(dictionarySizeFromFlags(head.fileFlags));
+		const source = new ReadableStream<Uint8Array>({
+			start(controller) {
+				if (data.length > 0) {
+					// a fresh ArrayBuffer copy so the queued chunk does not share
+					// memory with the archive buffer the caller still holds.
+					controller.enqueue(new Uint8Array(data));
+				}
+				controller.close();
+			},
+		});
+		const chunks: Uint8Array[] = [];
+		await using reader = new StreamReader(source);
+		try {
+			await decoder.decode(reader, head.unpackedSize, (chunk) => {
+				chunks.push(chunk);
+			});
+		} catch {
+			return undefined;
+		}
+		bytes = chunks.length === 1 ? chunks[0] : concat(chunks, head.unpackedSize);
+	}
+
+	try {
+		return decodeUtf8From(bytes as Uint8Array<ArrayBuffer>);
+	} catch {
+		return undefined;
+	}
+};
 
 const dumpFile = (entry: AggregatedFile, lines: string[]): void => {
 	const { compressedSize, crc, head, volume } = entry;
@@ -280,6 +373,9 @@ const dumpFile = (entry: AggregatedFile, lines: string[]): void => {
 	if (head.arctime !== undefined) {
 		lines.push(`  arctime=${formatIso(head.arctime.time, head.arctime.nanos)}`);
 	}
+	if (entry.comment !== undefined) {
+		lines.push(`  comment=${pythonRepr(entry.comment)}`);
+	}
 };
 
 // returns true when a single-volume buffer represents a continuation rather
@@ -299,10 +395,11 @@ const isContinuationVolume = (main: MainBlock, firstFile: FileBlock | undefined)
  * dumps a RAR3 (RAR1.5 - RAR4) archive in dumprar's verbosity-1 format.
  *
  * pass a single buffer for a self-contained archive or an ordered list of
- * volume buffers to aggregate a split set. only file entries are dumped, in
- * archive order; superseded versions and the trailing parts of split files
- * fold into their head per dumprar. archive- and entry-level comments and
- * encrypted-header archives are not yet rendered.
+ * volume buffers to aggregate a split set. file entries dump in archive
+ * order; superseded versions and the trailing parts of split files fold into
+ * their head per dumprar. RAR3 CMT sub-block comments are surfaced as
+ * `comment=...` lines; the RAR1.5/2.x oldComment subblocks, encrypted-data
+ * comments, and encrypted-header archives are not yet rendered.
  *
  * a single buffer that is actually a middle or trailing volume produces
  * dumprar's `--- ... is middle part of multi-vol archive` line so the test
@@ -313,10 +410,10 @@ const isContinuationVolume = (main: MainBlock, firstFile: FileBlock | undefined)
  * @param archivePath path label to print on the leading `Archive:` line
  * @returns the dump text, newline-terminated
  */
-export const dumpArchive = (
+export const dumpArchive = async (
 	data: Uint8Array | readonly Uint8Array[],
 	archivePath: string,
-): string => {
+): Promise<string> => {
 	const volumes: readonly Uint8Array[] = Array.isArray(data) ? data : [data as Uint8Array];
 	const isSingleVolume = !Array.isArray(data);
 
@@ -356,9 +453,31 @@ export const dumpArchive = (
 	const entries: AggregatedFile[] = [];
 	const entriesByName = new Map<string, AggregatedFile>();
 	let openName: string | undefined;
+	let archiveComment: string | undefined;
 
 	for (let vol = 0; vol < volumes.length; vol++) {
-		for (const block of walkBlocks(volumes[vol])) {
+		const buffer = volumes[vol];
+		for (const block of walkBlocks(buffer)) {
+			// CMT newSub blocks carry comments. SOLID = entry-level comment for
+			// the previous file; otherwise an archive-level comment. an unknown
+			// or unsupported encoding (encrypted, RAR1.5/2.x LZSS) returns
+			// `undefined` so we silently skip rather than disrupt the dump.
+			if (block.kind === 'sub' && block.name === 'CMT') {
+				const payload = buffer.subarray(block.dataOffset, block.dataOffset + block.dataSize);
+				const text = await decodeCmtPayload(block, payload);
+				if (text !== undefined) {
+					if ((block.fileFlags & FileFlag.solid) !== 0) {
+						const target = entries[entries.length - 1];
+						if (target !== undefined) {
+							target.comment = text;
+						}
+					} else {
+						archiveComment = text;
+					}
+				}
+				continue;
+			}
+
 			if (block.kind !== 'file') {
 				continue;
 			}
@@ -397,6 +516,10 @@ export const dumpArchive = (
 				openName = undefined;
 			}
 		}
+	}
+
+	if (archiveComment !== undefined) {
+		lines.push(`  comment=${pythonRepr(archiveComment)}`);
 	}
 
 	for (const entry of entries) {
