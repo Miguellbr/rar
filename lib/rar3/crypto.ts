@@ -11,7 +11,8 @@
  * call — so only the KDF is RAR3-specific here.
  */
 
-import { decryptAesCbcStream, importAesKey } from '../rar5/crypto.ts';
+import { decryptAesCbc, decryptAesCbcStream, importAesKey } from '../rar5/crypto.ts';
+import { BlockFlag, BlockType, MainFlag, RAR3_SIGNATURE } from './constants.ts';
 import { Sha1 } from './sha1.ts';
 
 /** AES-128 key and IV derived from a password and salt. */
@@ -100,6 +101,207 @@ export const rar3DeriveKey = (password: string, salt: Uint8Array): Rar3DerivedKe
 	}
 
 	return { iv, key };
+};
+
+// salts are 8 bytes; turn them into a stable cache key. `toHex` would do the
+// same thing but isn't available on every platform.
+const saltToKey = (salt: Uint8Array): string => {
+	let out = '';
+	for (const byte of salt) {
+		out += byte.toString(16).padStart(2, '0');
+	}
+	return out;
+};
+
+const COMMON_HEADER_SIZE = 7;
+
+/**
+ * given an archive whose main header sets `MAIN_PASSWORD`, returns a
+ * synthetic archive buffer in which every block past the main header has
+ * had its header bytes AES-decrypted in place. the result is laid out
+ * exactly like an unencrypted archive (mark + main + cleartext header +
+ * raw data area, repeated), so the existing sync walker, parser, dumper,
+ * and extractor can read it without change.
+ *
+ * each encrypted block on disk is `[8-byte salt | header ciphertext |
+ * data ciphertext]`, where:
+ *   - the header ciphertext covers `headerSize` bytes of cleartext padded
+ *     up to a 16-byte boundary, AES-CBC chained from the iv that
+ *     {@link rar3DeriveKey} produces for the per-block salt
+ *   - the data area (`add_size` bytes) lives in its own region. when the
+ *     entry sets FileFlag.password it is itself AES-CBC ciphertext keyed
+ *     by the file salt inside the just-decrypted header; otherwise it is
+ *     plaintext. either way the main-level decryption does not touch it,
+ *     and the bytes are copied through unchanged for downstream code to
+ *     handle.
+ *
+ * salts repeat in practice, so a small cache amortises the KDF cost.
+ *
+ * @param password the user-supplied password
+ * @param archive the raw archive bytes
+ * @param encryptedStart the offset at which encrypted blocks begin (just
+ * past the cleartext mark + main header)
+ * @returns a fresh buffer of the same logical contents with the header
+ * encryption wrapper stripped
+ */
+export const decryptRar3HeaderStream = async (
+	password: string,
+	archive: Uint8Array,
+	encryptedStart: number,
+): Promise<Uint8Array> => {
+	const synth: Uint8Array[] = [];
+	const cache = new Map<string, { aes: CryptoKey; iv: Uint8Array<ArrayBuffer> }>();
+
+	let offset = encryptedStart;
+	while (offset < archive.length) {
+		if (offset + 8 + 16 > archive.length) {
+			throw new Error(
+				`rar3 encrypted block at 0x${offset.toString(16)} is truncated`,
+			);
+		}
+
+		const salt = archive.subarray(offset, offset + 8);
+		const cacheKey = saltToKey(salt);
+		let entry = cache.get(cacheKey);
+		if (entry === undefined) {
+			const { iv, key } = rar3DeriveKey(password, salt);
+			const aes = await importAesKey(key);
+			entry = { aes, iv };
+			cache.set(cacheKey, entry);
+		}
+
+		// peek the first ciphertext block so we can read headerSize (and, for
+		// LONG blocks, add_size).
+		const firstCipher = new Uint8Array(archive.subarray(offset + 8, offset + 8 + 16));
+		const firstPlain = await decryptAesCbc(entry.aes, entry.iv, firstCipher);
+
+		const blockType = firstPlain[2];
+		const blockFlags = firstPlain[3] | (firstPlain[4] << 8);
+		const headerSize = firstPlain[5] | (firstPlain[6] << 8);
+		if (headerSize < COMMON_HEADER_SIZE) {
+			throw new Error(
+				`rar3 encrypted block at 0x${offset.toString(16)} has invalid headerSize ${headerSize}`,
+			);
+		}
+
+		// LONG blocks place add_size at offset 7..10. for file/sub blocks this
+		// overlays the `packed_size` field, so the peek works uniformly across
+		// block kinds.
+		let addSize = 0;
+		if ((blockFlags & BlockFlag.longBlock) !== 0) {
+			if (firstPlain.length < 11) {
+				throw new Error(
+					`rar3 encrypted block at 0x${offset.toString(16)} truncated before add_size`,
+				);
+			}
+			addSize = (firstPlain[7] | (firstPlain[8] << 8) | (firstPlain[9] << 16) |
+				(firstPlain[10] << 24)) >>> 0;
+		}
+
+		const headerCipherLen = Math.ceil(headerSize / 16) * 16;
+		if (offset + 8 + headerCipherLen + addSize > archive.length) {
+			throw new Error(
+				`rar3 encrypted block at 0x${offset.toString(16)} extends past EOF:` +
+					` need ${8 + headerCipherLen + addSize}, have ${archive.length - offset}`,
+			);
+		}
+
+		let headerCleartext: Uint8Array;
+		if (headerCipherLen <= 16) {
+			headerCleartext = firstPlain.subarray(0, headerSize);
+		} else {
+			// decrypt blocks 2..N with iv = first ciphertext block (CBC chain).
+			const restCipher = new Uint8Array(
+				archive.subarray(offset + 8 + 16, offset + 8 + headerCipherLen),
+			);
+			const restPlain = await decryptAesCbc(entry.aes, firstCipher, restCipher);
+			const combined = new Uint8Array(headerCipherLen);
+			combined.set(firstPlain);
+			combined.set(restPlain, 16);
+			headerCleartext = combined.subarray(0, headerSize);
+		}
+		synth.push(headerCleartext);
+
+		// data area: untouched bytes; downstream file-level decryption handles
+		// FileFlag.password entries using the salt inside the just-emitted
+		// header.
+		if (addSize > 0) {
+			synth.push(archive.subarray(offset + 8 + headerCipherLen, offset + 8 + headerCipherLen + addSize));
+		}
+
+		offset += 8 + headerCipherLen + addSize;
+
+		// endArc terminates the archive; bytes past it are encoder padding.
+		if (blockType === BlockType.endArc) {
+			break;
+		}
+	}
+
+	let totalLen = encryptedStart;
+	for (const block of synth) {
+		totalLen += block.length;
+	}
+	const out = new Uint8Array(totalLen);
+	out.set(archive.subarray(0, encryptedStart));
+	let writePos = encryptedStart;
+	for (const block of synth) {
+		out.set(block, writePos);
+		writePos += block.length;
+	}
+	return out;
+};
+
+// ensures the (presumed) RAR3 archive carries the signature at offset 0 — the
+// caller has already checked this for unencrypted archives, but the header
+// decryptor wants to refuse early when the input clearly isn't RAR3.
+const assertRar3Signature = (archive: Uint8Array): void => {
+	if (archive.length < RAR3_SIGNATURE.length) {
+		throw new Error('rar3 archive shorter than the 7-byte signature');
+	}
+	for (let idx = 0; idx < RAR3_SIGNATURE.length; idx++) {
+		if (archive[idx] !== RAR3_SIGNATURE[idx]) {
+			throw new Error('not a rar3 archive: signature missing');
+		}
+	}
+};
+
+/**
+ * if `archive`'s main header has `MAIN_PASSWORD` set and `password` is
+ * supplied, returns a synthetic archive with the encryption wrapper
+ * stripped (see {@link decryptRar3HeaderStream}); otherwise returns
+ * `archive` unchanged.
+ *
+ * @param password the password to try, or `undefined` to skip decryption
+ * @param archive the raw archive bytes
+ * @returns the same buffer when not encrypted, or a freshly decrypted copy
+ */
+export const decryptRar3HeadersIfNeeded = async (
+	password: string | undefined,
+	archive: Uint8Array,
+): Promise<Uint8Array> => {
+	assertRar3Signature(archive);
+	// the main header always follows the 7-byte signature.
+	const mainOffset = RAR3_SIGNATURE.length;
+	if (archive.length < mainOffset + COMMON_HEADER_SIZE) {
+		return archive;
+	}
+	// parse the cleartext main header just enough to test MAIN_PASSWORD and
+	// find the end of the cleartext prefix. main never sets LONG_BLOCK in any
+	// fixture we care about, but we honour it for safety.
+	const mainType = archive[mainOffset + 2];
+	if (mainType !== BlockType.main) {
+		return archive;
+	}
+	const mainFlags = archive[mainOffset + 3] | (archive[mainOffset + 4] << 8);
+	const mainSize = archive[mainOffset + 5] | (archive[mainOffset + 6] << 8);
+	if ((mainFlags & MainFlag.password) === 0) {
+		return archive;
+	}
+	if (password === undefined) {
+		throw new Error('rar3 archive has encrypted headers; pass a password to read it');
+	}
+	const encryptedStart = mainOffset + mainSize;
+	return await decryptRar3HeaderStream(password, archive, encryptedStart);
 };
 
 /**

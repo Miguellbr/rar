@@ -14,11 +14,10 @@ import { crc32 } from '../lib/utils/crc32.ts';
 const FIXTURES_DIR = new URL('./fixtures/rarfile/files/', import.meta.url);
 
 // fixtures that should not be passed to unrar3 at all: a misnamed RAR5
-// archive, the encrypted-header fixture, and the multi-volume continuations
-// which only round-trip when bundled with their first volume.
+// archive and the multi-volume continuations which only round-trip when
+// bundled with their first volume.
 const PER_FILE_SKIP = new Set([
 	'ctime5.rar',
-	'rar3-comment-hpsw.rar',
 	'rar3-old.r00',
 	'rar3-old.r01',
 	'rar3-old.rar',
@@ -27,6 +26,9 @@ const PER_FILE_SKIP = new Set([
 	'rar3-vols.part3.rar',
 	'unicode.rar',
 ]);
+
+// password used by every encrypted fixture in the corpus.
+const CORPUS_PASSWORD = 'password';
 
 const fixtures = [...Deno.readDirSync(FIXTURES_DIR)]
 	.map((entry) => entry.name)
@@ -40,11 +42,12 @@ for (const name of fixtures) {
 		fn: async () => {
 			const data = Deno.readFileSync(new URL(name, FIXTURES_DIR));
 			const reader = fromUint8Array(data);
+			const password = name.includes('-psw') || name.includes('-hpsw') ? CORPUS_PASSWORD : undefined;
 
 			let entries = 0;
 			let storedVerified = 0;
 
-			for await (const entry of unrar3(reader)) {
+			for await (const entry of unrar3(reader, { password })) {
 				entries++;
 
 				if (entry.isDirectory) {

@@ -21,7 +21,7 @@ import { StreamReader } from '../utils/stream-reader.ts';
 import type { DosTime, EndArcBlock, ExtTime, FileBlock, MainBlock } from './block.ts';
 import { walkBlocks } from './block.ts';
 import { CompressMethod, EndArcFlag, FileFlag, HostOs, MainFlag } from './constants.ts';
-import { decryptRar3Stream } from './crypto.ts';
+import { decryptRar3HeadersIfNeeded, decryptRar3Stream } from './crypto.ts';
 import { Rar3Decoder } from './unpack.ts';
 
 // #region flag rendering
@@ -466,8 +466,16 @@ export const dumpArchive = async (
 	archivePath: string,
 	options?: DumpOptions,
 ): Promise<string> => {
-	const volumes: readonly Uint8Array[] = Array.isArray(data) ? data : [data as Uint8Array];
+	const rawVolumes: readonly Uint8Array[] = Array.isArray(data) ? data : [data as Uint8Array];
 	const isSingleVolume = !Array.isArray(data);
+
+	// strip the AES wrapper from every volume whose main header has
+	// MAIN_PASSWORD set, before any walker touches them. unencrypted volumes
+	// pass through unchanged.
+	const volumes: Uint8Array[] = [];
+	for (const buffer of rawVolumes) {
+		volumes.push(await decryptRar3HeadersIfNeeded(options?.password, buffer));
+	}
 
 	const lines: string[] = [`Archive: ${archivePath}`];
 

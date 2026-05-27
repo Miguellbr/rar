@@ -1,13 +1,14 @@
-import { concat, decodeUtf8From } from '../utils/buffer.ts';
+import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
 import { type DataSegment, deferStream, readBytes, streamSegments } from '../utils/segments.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
 
 import type { UnrarOptions } from '../options.ts';
+import { fromUint8Array } from '../reader/common.ts';
 import type { Reader } from '../reader/types.ts';
 import type { FileBlock, Rar3Block } from './block.ts';
 import { parseBlock } from './block.ts';
-import { CompressMethod, FileFlag, RAR3_SIGNATURE } from './constants.ts';
-import { decryptRar3Stream } from './crypto.ts';
+import { CompressMethod, FileFlag, MainFlag, RAR3_SIGNATURE } from './constants.ts';
+import { decryptRar3HeadersIfNeeded, decryptRar3Stream } from './crypto.ts';
 import { Rar3Decoder } from './unpack.ts';
 
 /**
@@ -377,6 +378,58 @@ export class Rar3Entry {
 
 // #region unrar3
 
+// reads a reader's full bytes and returns a fresh Uint8Array. used when an
+// hpsw volume needs to be header-decrypted in memory before walking.
+const slurpReader = async (reader: Reader): Promise<Uint8Array> => {
+	const stream = await reader.read(0, reader.length);
+	return await read(stream, reader.length);
+};
+
+// determines whether a volume's main header sets MAIN_PASSWORD by peeking
+// the first two block headers (mark + main). returns false on any read or
+// parse failure so the caller can defer error handling to the walker.
+const hasEncryptedHeaders = async (reader: Reader): Promise<boolean> => {
+	const probeLen = Math.min(reader.length, RAR3_SIGNATURE.length + COMMON_HEADER_SIZE);
+	if (probeLen < RAR3_SIGNATURE.length + COMMON_HEADER_SIZE) {
+		return false;
+	}
+	try {
+		const probe = await readBytes(reader, 0, probeLen);
+		const mainOffset = RAR3_SIGNATURE.length;
+		const mainType = probe[mainOffset + 2];
+		const mainFlags = probe[mainOffset + 3] | (probe[mainOffset + 4] << 8);
+		return mainType === 0x73 /* main */ && (mainFlags & MainFlag.password) !== 0;
+	} catch {
+		return false;
+	}
+};
+
+// for each input reader: if its main header is encrypted, slurp + decrypt
+// and return a synthetic in-memory reader; otherwise pass through unchanged.
+const prepareReaders = async (
+	inputReaders: readonly Reader[],
+	password: string | undefined,
+): Promise<readonly Reader[]> => {
+	const out: Reader[] = [];
+	for (const reader of inputReaders) {
+		if (!(await hasEncryptedHeaders(reader))) {
+			out.push(reader);
+			continue;
+		}
+		if (password === undefined) {
+			throw new Error(
+				'rar3 archive has encrypted headers; pass `password` to unrar3 to read it',
+			);
+		}
+		const raw = await slurpReader(reader);
+		const decrypted = await decryptRar3HeadersIfNeeded(password, raw);
+		// fromUint8Array requires Uint8Array<ArrayBuffer>, which is what
+		// decryptRar3HeadersIfNeeded returns (it always allocates fresh).
+		out.push(fromUint8Array(decrypted as Uint8Array<ArrayBuffer>));
+	}
+	return out;
+};
+
 /**
  * extracts entries from a RAR3 (RAR1.5 - RAR4) archive.
  *
@@ -402,8 +455,14 @@ export async function* unrar3(
 	source: Reader | readonly Reader[],
 	options?: UnrarOptions,
 ): AsyncGenerator<Rar3Entry> {
-	const readers: readonly Reader[] = Array.isArray(source) ? source : [source];
+	const inputReaders: readonly Reader[] = Array.isArray(source) ? source : [source];
 	const password = options?.password;
+
+	// hpsw archives: any volume whose main header sets MAIN_PASSWORD needs to
+	// be slurped into memory and header-decrypted in one pass before the
+	// streaming walker can read it. unencrypted volumes pass through with no
+	// extra allocation.
+	const readers = await prepareReaders(inputReaders, password);
 
 	let openHead: FileBlock | undefined;
 	let openSegments: DataSegment[] = [];
