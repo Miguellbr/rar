@@ -28,9 +28,13 @@ import { Rar3Decoder } from './unpack.ts';
 // #region helpers
 
 const COMMON_HEADER_SIZE = 7;
-// COMMON_HEADER_SIZE plus the optional 4-byte add_size field that LONG_BLOCK
-// brings; never crosses past a real block's header.
-const HEADER_PROBE_SIZE = COMMON_HEADER_SIZE + 4;
+// the probe is sized to cover almost every block we'll meet in one
+// reader.read() — RAR3 file/main/sub headers in the wild fit easily under
+// 512 bytes (32-byte fixed prefix + a short filename + a few extras).
+// reading more bytes than the header turns into a no-op subarray; reading
+// fewer would force a second round trip to fetch the rest, which is
+// exactly what we're avoiding by oversizing the probe.
+const HEADER_PROBE_SIZE = 512;
 
 // #endregion
 

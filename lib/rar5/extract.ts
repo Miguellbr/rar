@@ -109,13 +109,20 @@ const readHeaderFrame = async (
 	headerCipher: CryptoKey | undefined,
 ): Promise<{ headerBytes: Uint8Array; frameSize: number }> => {
 	if (headerCipher === undefined) {
-		// the header size is only known once the CRC and the size vint are read.
-		const peek = await readBytes(reader, offset, Math.min(8, reader.length - offset));
-		const probe = new Cursor(peek);
-		probe.skip(4);
-		const headerSize = probe.vint() + probe.pos;
+		// the header size is only known once the CRC and the size vint are
+		// read, but RAR5 headers fit easily under a kilobyte in practice;
+		// over-read on the first attempt to skip the follow-up readBytes
+		// for the common case, and only re-read when a header is unusually
+		// large.
+		const probeLen = Math.min(1024, reader.length - offset);
+		const probe = await readBytes(reader, offset, probeLen);
+		const cursor = new Cursor(probe);
+		cursor.skip(4);
+		const headerSize = cursor.vint() + cursor.pos;
 
-		const headerBytes = await readBytes(reader, offset, headerSize);
+		const headerBytes = headerSize <= probe.length
+			? (probe.subarray(0, headerSize) as Uint8Array<ArrayBuffer>)
+			: await readBytes(reader, offset, headerSize);
 		return { frameSize: headerSize, headerBytes };
 	}
 
