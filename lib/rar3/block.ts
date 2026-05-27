@@ -98,6 +98,28 @@ export interface MainBlock extends BlockCommon {
 	kind: 'main';
 	/** archive flag bits, re-exposed as `mainFlags` for symmetry with `block.blockFlags` */
 	mainFlags: number;
+	/** legacy archive-level comment subblock, when {@link MainFlag.comment} is set */
+	oldComment?: OldCommentSubBlock;
+}
+
+/**
+ * a legacy comment subblock embedded in the trailing area of a MAIN or FILE
+ * header. RAR1.5 and RAR2.x stored comments inline this way rather than as
+ * a top-level SUB block. the data area is either stored verbatim
+ * ({@link OldCommentMethod.stored}) or compressed with the v15/v20 LZSS
+ * encoder, depending on `method`.
+ */
+export interface OldCommentSubBlock {
+	/** decompressed length declared in the subblock's mini header */
+	decompressedSize: number;
+	/** version stamp (15 = RAR1.5, 20 = RAR2.0+) */
+	version: number;
+	/** compression method (0x30 stored, 0x33-0x35 v15/v20 LZSS) */
+	method: number;
+	/** CRC16 of the decompressed data */
+	dataCrc: number;
+	/** raw on-disk bytes: stored or compressed depending on `method` */
+	data: Uint8Array;
 }
 
 /** a single high-precision timestamp parsed from the extended-time record. */
@@ -141,6 +163,8 @@ export interface FileBlock extends BlockCommon {
 	attributes: number;
 	/** 8-byte per-file salt, when the SALT flag is set */
 	salt?: Uint8Array;
+	/** legacy file-level comment subblock, when {@link FileFlag.comment} is set */
+	oldComment?: OldCommentSubBlock;
 }
 
 /** the end-of-archive marker. */
@@ -165,6 +189,40 @@ export type Rar3Block = EndArcBlock | FileBlock | MainBlock | MarkBlock | Unknow
 // #endregion
 
 // #region helpers
+
+// walks the trailing-subblock region of a MAIN or FILE header looking for an
+// OLD_COMMENT (0x75) record. each subblock opens with the 7-byte common
+// block header (CRC16 + type + flags + size), and oldComment additionally
+// carries a 6-byte mini header (declen + ver + meth + dataCrc) before its
+// data area. the parent block's CRC excludes the trailing region, so we
+// don't verify the subblock CRC16; a failed decompression downstream is the
+// signal that the bytes are corrupt.
+const findOldCommentSubblock = (region: Uint8Array): OldCommentSubBlock | undefined => {
+	const COMMON = 7;
+	const COMMENT_HDR = 6;
+
+	let pos = 0;
+	while (pos + COMMON <= region.length) {
+		const subType = region[pos + 2];
+		const subSize = region[pos + 5] | (region[pos + 6] << 8);
+		if (subSize < COMMON || pos + subSize > region.length) {
+			return undefined;
+		}
+
+		if (subType === BlockType.oldComment && pos + COMMON + COMMENT_HDR <= pos + subSize) {
+			const hdrPos = pos + COMMON;
+			const decompressedSize = region[hdrPos] | (region[hdrPos + 1] << 8);
+			const version = region[hdrPos + 2];
+			const method = region[hdrPos + 3];
+			const dataCrc = region[hdrPos + 4] | (region[hdrPos + 5] << 8);
+			const data = region.subarray(hdrPos + COMMENT_HDR, pos + subSize);
+			return { data, dataCrc, decompressedSize, method, version };
+		}
+
+		pos += subSize;
+	}
+	return undefined;
+};
 
 const decodeDosTime = (raw: number): DosTime => {
 	return {
@@ -363,6 +421,16 @@ const parseFileLikeBlock = (
 		parseExtTime(block, cursor);
 	}
 
+	if ((fileFlags & FileFlag.comment) !== 0) {
+		// the cursor now sits at the trailing subblock area, past every fixed
+		// field including the extended-time record.
+		const region = cursor.data.subarray(cursor.pos, common.headerSize);
+		const oldComment = findOldCommentSubblock(region);
+		if (oldComment !== undefined) {
+			block.oldComment = oldComment;
+		}
+	}
+
 	return block;
 };
 
@@ -431,8 +499,23 @@ const parseXTime = (nibble: number, cursor: Cursor, base?: DosTime): ExtTime | u
 	return { nanos: rem * 100, time };
 };
 
-const parseMainBlock = (common: BlockCommon): MainBlock => {
-	return { ...common, kind: 'main', mainFlags: common.blockFlags };
+const parseMainBlock = (common: BlockCommon, cursor: Cursor, headerSize: number): MainBlock => {
+	// the 6 reserved bytes (`high_pos_av`, `pos_av`) sit right after the common
+	// header; ENCRYPTVER adds one more before the trailing subblock area.
+	cursor.skip(6);
+	if ((common.blockFlags & MainFlag.encryptVer) !== 0) {
+		cursor.skip(1);
+	}
+
+	const block: MainBlock = { ...common, kind: 'main', mainFlags: common.blockFlags };
+	if ((common.blockFlags & MainFlag.comment) !== 0) {
+		const region = cursor.data.subarray(cursor.pos, headerSize);
+		const oldComment = findOldCommentSubblock(region);
+		if (oldComment !== undefined) {
+			block.oldComment = oldComment;
+		}
+	}
+	return block;
 };
 
 const parseEndArcBlock = (common: BlockCommon, cursor: Cursor): EndArcBlock => {
@@ -522,7 +605,7 @@ export const parseBlock = (header: Uint8Array, headerOffset: number): Rar3Block 
 	let block: Rar3Block;
 	switch (blockType) {
 		case BlockType.main: {
-			block = parseMainBlock(common);
+			block = parseMainBlock(common, cursor, headerSize);
 			break;
 		}
 		case BlockType.file: {
