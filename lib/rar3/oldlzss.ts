@@ -621,3 +621,478 @@ export const decodeOldLzss15 = (data: Uint8Array, decompressedSize: number): Uin
 };
 
 // #endregion
+
+// #region v20 huffman
+
+// canonical Huffman decoder. `decodeLen[k]` stores the left-aligned upper
+// limit code for length k (i.e. `cumulative_count[k] << (16 - k)`), used to
+// pick the correct length given the next 16 bits. `decodePos[k]` is the
+// offset into `symbols` where length-k codes start. `symbols` holds the
+// alphabet ordered by canonical code; v20's longest code is 15 bits so we
+// fix a max code length of 15.
+const MAX_HUFF_LEN = 15;
+
+interface HuffmanTable {
+	size: number;
+	decodeLen: Int32Array;
+	decodePos: Uint32Array;
+	symbols: Uint16Array;
+}
+
+const buildHuffmanTable = (lengths: Uint8Array, size: number): HuffmanTable => {
+	const counts = new Uint32Array(MAX_HUFF_LEN + 1);
+	for (let idx = 0; idx < size; idx++) {
+		const len = lengths[idx];
+		if (len > MAX_HUFF_LEN) {
+			throw new Error(`rar2 huffman code length ${len} exceeds ${MAX_HUFF_LEN}`);
+		}
+		counts[len]++;
+	}
+	counts[0] = 0;
+
+	const decodeLen = new Int32Array(MAX_HUFF_LEN + 1);
+	const decodePos = new Uint32Array(MAX_HUFF_LEN + 1);
+
+	let upperLimit = 0;
+	for (let len = 1; len <= MAX_HUFF_LEN; len++) {
+		upperLimit += counts[len];
+		decodeLen[len] = upperLimit << (16 - len);
+		decodePos[len] = decodePos[len - 1] + counts[len - 1];
+		upperLimit <<= 1;
+	}
+	if (upperLimit > 65536) {
+		throw new Error('rar2 over-subscribed huffman table');
+	}
+
+	const symbols = new Uint16Array(size);
+	const cursor = decodePos.slice();
+	for (let idx = 0; idx < size; idx++) {
+		const len = lengths[idx];
+		if (len > 0) {
+			symbols[cursor[len]++] = idx;
+		}
+	}
+
+	return { decodeLen, decodePos, size, symbols };
+};
+
+const decodeHuffSymbol = (table: HuffmanTable, reader: BitReader): number => {
+	const field = reader.peek16();
+
+	let length = MAX_HUFF_LEN;
+	for (let candidate = 1; candidate < MAX_HUFF_LEN; candidate++) {
+		if (field < table.decodeLen[candidate]) {
+			length = candidate;
+			break;
+		}
+	}
+
+	reader.addbits(length);
+	const position = table.decodePos[length] + ((field - table.decodeLen[length - 1]) >>> (16 - length));
+	return table.symbols[position >= table.size ? 0 : position];
+};
+
+// #endregion
+
+// #region v20 tables
+
+const NC20 = 298;
+const DC20 = 48;
+const RC20 = 28;
+const BC20 = 19;
+
+// length/distance tables for v20's main LD/DD/RD codes. each symbol in the
+// alphabet beyond a base value uses a fixed number of extra raw bits.
+const L_DECODE_V20 = [
+	0,
+	1,
+	2,
+	3,
+	4,
+	5,
+	6,
+	7,
+	8,
+	10,
+	12,
+	14,
+	16,
+	20,
+	24,
+	28,
+	32,
+	40,
+	48,
+	56,
+	64,
+	80,
+	96,
+	112,
+	128,
+	160,
+	192,
+	224,
+];
+const L_BITS_V20 = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5];
+
+const D_DECODE_V20 = [
+	0,
+	1,
+	2,
+	3,
+	4,
+	6,
+	8,
+	12,
+	16,
+	24,
+	32,
+	48,
+	64,
+	96,
+	128,
+	192,
+	256,
+	384,
+	512,
+	768,
+	1024,
+	1536,
+	2048,
+	3072,
+	4096,
+	6144,
+	8192,
+	12288,
+	16384,
+	24576,
+	32768,
+	49152,
+	65536,
+	98304,
+	131072,
+	196608,
+	262144,
+	327680,
+	393216,
+	458752,
+	524288,
+	589824,
+	655360,
+	720896,
+	786432,
+	851968,
+	917504,
+	983040,
+];
+const D_BITS_V20 = [
+	0,
+	0,
+	0,
+	0,
+	1,
+	1,
+	2,
+	2,
+	3,
+	3,
+	4,
+	4,
+	5,
+	5,
+	6,
+	6,
+	7,
+	7,
+	8,
+	8,
+	9,
+	9,
+	10,
+	10,
+	11,
+	11,
+	12,
+	12,
+	13,
+	13,
+	14,
+	14,
+	15,
+	15,
+	16,
+	16,
+	16,
+	16,
+	16,
+	16,
+	16,
+	16,
+	16,
+	16,
+	16,
+	16,
+	16,
+	16,
+];
+const SD_DECODE_V20 = [0, 4, 8, 16, 32, 64, 128, 192];
+const SD_BITS_V20 = [2, 2, 3, 4, 5, 6, 6, 6];
+
+// #endregion
+
+// #region v20 decoder
+
+interface State20 {
+	reader: BitReader;
+	window: Uint8Array;
+	windowMask: number;
+	out: Uint8Array;
+	outIdx: number;
+	unpPtr: number;
+	prevPtr: number;
+	firstWinDone: boolean;
+	destUnpSize: number;
+
+	oldDist: Int32Array;
+	oldDistPtr: number;
+	lastDist: number;
+	lastLength: number;
+
+	// the 4-bit-per-symbol code-length table carried across `ReadTables20`
+	// invocations. for a non-solid block it starts zeroed and accumulates
+	// deltas from each table block; here we always re-init it.
+	unpOldTable: Uint8Array;
+
+	tables?: {
+		ld: HuffmanTable;
+		dd: HuffmanTable;
+		rd: HuffmanTable;
+	};
+}
+
+const initState20 = (reader: BitReader, decompressedSize: number): State20 => {
+	const WIN_SIZE = 0x100000;
+	return {
+		destUnpSize: decompressedSize,
+		firstWinDone: false,
+		lastDist: 0,
+		lastLength: 0,
+		oldDist: new Int32Array(4),
+		oldDistPtr: 0,
+		out: new Uint8Array(decompressedSize),
+		outIdx: 0,
+		prevPtr: 0,
+		reader,
+		unpOldTable: new Uint8Array(NC20 + DC20 + RC20),
+		unpPtr: 0,
+		window: new Uint8Array(WIN_SIZE),
+		windowMask: WIN_SIZE - 1,
+	};
+};
+
+const writeByte20 = (state: State20, byte: number): void => {
+	state.window[state.unpPtr] = byte;
+	if (state.outIdx < state.out.length) {
+		state.out[state.outIdx++] = byte;
+	}
+	state.unpPtr = (state.unpPtr + 1) & state.windowMask;
+};
+
+// the generic LZ copy. distances pointing past the populated window (or 0)
+// emit zeros — matches unrar's `CopyString` behavior on malformed input.
+const copyString20 = (state: State20, length: number, distance: number): void => {
+	state.lastDist = distance;
+	state.oldDist[state.oldDistPtr] = distance;
+	state.oldDistPtr = (state.oldDistPtr + 1) & 3;
+	state.lastLength = length;
+	state.destUnpSize -= length;
+
+	const bad = distance === 0 ||
+		distance > state.window.length ||
+		(distance > state.unpPtr && !state.firstWinDone);
+
+	for (let i = 0; i < length; i++) {
+		const byte = bad ? 0 : state.window[(state.unpPtr - distance) & state.windowMask];
+		writeByte20(state, byte);
+	}
+};
+
+// reads a fresh set of LD/DD/RD Huffman tables out of the bitstream and
+// stores them on the state. the first 2 stream bits are
+// `AudioBlock | TableReset`; we reject audio blocks (comments never carry
+// audio) and re-zero the carry-over table when reset is set.
+const readTables20 = (state: State20): boolean => {
+	const reader = state.reader;
+	const bitField = reader.peek16();
+	const audio = (bitField & 0x8000) !== 0;
+	if (audio) {
+		// audio mode is only used for compressed PCM data; comments never carry
+		// audio blocks, so we treat this as malformed.
+		throw new Error('rar2 audio block not supported');
+	}
+	if ((bitField & 0x4000) === 0) {
+		state.unpOldTable.fill(0);
+	}
+	reader.addbits(2);
+
+	const tableSize = NC20 + DC20 + RC20;
+
+	const bitLengths = new Uint8Array(BC20);
+	for (let i = 0; i < BC20; i++) {
+		bitLengths[i] = reader.peek16() >>> 12;
+		reader.addbits(4);
+	}
+	const precode = buildHuffmanTable(bitLengths, BC20);
+
+	const table = new Uint8Array(tableSize);
+	for (let i = 0; i < tableSize;) {
+		const number = decodeHuffSymbol(precode, reader);
+		if (number < 16) {
+			table[i] = (number + state.unpOldTable[i]) & 0xf;
+			i++;
+		} else if (number === 16) {
+			let n = (reader.peek16() >>> 14) + 3;
+			reader.addbits(2);
+			if (i === 0) {
+				return false;
+			}
+			while (n-- > 0 && i < tableSize) {
+				table[i] = table[i - 1];
+				i++;
+			}
+		} else {
+			let n: number;
+			if (number === 17) {
+				n = (reader.peek16() >>> 13) + 3;
+				reader.addbits(3);
+			} else {
+				n = (reader.peek16() >>> 9) + 11;
+				reader.addbits(7);
+			}
+			while (n-- > 0 && i < tableSize) {
+				table[i++] = 0;
+			}
+		}
+	}
+
+	state.tables = {
+		dd: buildHuffmanTable(table.subarray(NC20, NC20 + DC20), DC20),
+		ld: buildHuffmanTable(table.subarray(0, NC20), NC20),
+		rd: buildHuffmanTable(table.subarray(NC20 + DC20), RC20),
+	};
+	state.unpOldTable.set(table);
+	return true;
+};
+
+const unpack20 = (state: State20): void => {
+	if (!readTables20(state)) {
+		return;
+	}
+	state.destUnpSize--;
+
+	while (state.destUnpSize >= 0) {
+		state.unpPtr &= state.windowMask;
+		state.firstWinDone = state.firstWinDone || state.prevPtr > state.unpPtr;
+		state.prevPtr = state.unpPtr;
+
+		const number = decodeHuffSymbol(state.tables!.ld, state.reader);
+
+		if (number < 256) {
+			writeByte20(state, number);
+			state.destUnpSize--;
+			continue;
+		}
+		if (number > 269) {
+			const idx = number - 270;
+			let length = L_DECODE_V20[idx] + 3;
+			let bits = L_BITS_V20[idx];
+			if (bits > 0) {
+				length += state.reader.peek16() >>> (16 - bits);
+				state.reader.addbits(bits);
+			}
+
+			const distNumber = decodeHuffSymbol(state.tables!.dd, state.reader);
+			let distance = D_DECODE_V20[distNumber] + 1;
+			bits = D_BITS_V20[distNumber];
+			if (bits > 0) {
+				distance += state.reader.peek16() >>> (16 - bits);
+				state.reader.addbits(bits);
+			}
+
+			if (distance >= 0x2000) {
+				length++;
+				if (distance >= 0x40000) {
+					length++;
+				}
+			}
+			copyString20(state, length, distance);
+			continue;
+		}
+		if (number === 269) {
+			if (!readTables20(state)) {
+				return;
+			}
+			continue;
+		}
+		if (number === 256) {
+			copyString20(state, state.lastLength, state.lastDist);
+			continue;
+		}
+		if (number < 261) {
+			const distance = state.oldDist[(state.oldDistPtr - (number - 256)) & 3] >>> 0;
+			const lengthNumber = decodeHuffSymbol(state.tables!.rd, state.reader);
+			let length = L_DECODE_V20[lengthNumber] + 2;
+			const bits = L_BITS_V20[lengthNumber];
+			if (bits > 0) {
+				length += state.reader.peek16() >>> (16 - bits);
+				state.reader.addbits(bits);
+			}
+			if (distance >= 0x101) {
+				length++;
+				if (distance >= 0x2000) {
+					length++;
+					if (distance >= 0x40000) {
+						length++;
+					}
+				}
+			}
+			copyString20(state, length, distance);
+			continue;
+		}
+		// 261..268: 2-byte short match with a fixed-table distance.
+		const idx = number - 261;
+		let distance = SD_DECODE_V20[idx] + 1;
+		const bits = SD_BITS_V20[idx];
+		if (bits > 0) {
+			distance += state.reader.peek16() >>> (16 - bits);
+			state.reader.addbits(bits);
+		}
+		copyString20(state, 2, distance);
+	}
+};
+
+/**
+ * decompresses a RAR 2.x (`extractVersion=20` or 26) LZSS stream.
+ *
+ * @param data the compressed bytes from the on-disk subblock
+ * @param decompressedSize declared decompressed length
+ * @returns the decompressed bytes, or `undefined` if decoding failed
+ */
+export const decodeOldLzss20 = (data: Uint8Array, decompressedSize: number): Uint8Array | undefined => {
+	if (decompressedSize <= 0) {
+		return new Uint8Array(0);
+	}
+	try {
+		const reader = new BitReader(data);
+		const state = initState20(reader, decompressedSize);
+		unpack20(state);
+		if (state.outIdx !== decompressedSize) {
+			return undefined;
+		}
+		return state.out;
+	} catch {
+		return undefined;
+	}
+};
+
+// #endregion
