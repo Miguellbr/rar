@@ -18,3 +18,14 @@ export interface UnrarOptions {
 	 */
 	password?: string;
 }
+
+/** options recognised by the archive header walkers. */
+export interface WalkOptions {
+	/**
+	 * the password used to decrypt encrypted block headers. RAR5 derives the
+	 * header key once per (salt, KDF count) pair via an internal cache; RAR3
+	 * decrypts each volume's header span in one pass when its main header is
+	 * marked password-protected.
+	 */
+	password?: string;
+}

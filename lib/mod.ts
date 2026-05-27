@@ -36,10 +36,10 @@ export {
 	UnrarError,
 	UnsupportedFeatureError,
 } from './errors.ts';
-export type { UnrarOptions } from './options.ts';
+export type { UnrarOptions, WalkOptions } from './options.ts';
 export { Rar5Entry, unrar5 } from './rar5/extract.ts';
-export type { VolumeBlock, WalkOptions } from './rar5/extract.ts';
-export { walkArchive } from './rar5/extract.ts';
+export type { Rar5VolumeBlock } from './rar5/extract.ts';
+export { walkRar5Archive } from './rar5/extract.ts';
 export { Rar3Entry, unrar3 } from './rar3/extract.ts';
 
 /**

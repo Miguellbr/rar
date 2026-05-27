@@ -11,9 +11,9 @@ import { crc32 } from '../utils/crc32.ts';
 import { type DataSegment, deferStream, readBytes, streamSegments } from '../utils/segments.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
 
-import type { UnrarOptions } from '../options.ts';
+import type { UnrarOptions, WalkOptions } from '../options.ts';
 import type { Reader } from '../reader/types.ts';
-import type { FileBlock, FileEncryption } from './block.ts';
+import type { FileBlock, FileEncryption, Rar5Block } from './block.ts';
 import { isDirectory, isSymlink, parseBlock } from './block.ts';
 import { BlockFlag, COMPRESSION_SOLID, FileEncryptionFlag, RAR5_SIGNATURE } from './constants.ts';
 import { decryptAesCbc, decryptAesCbcStream, KeyCache, tweakCrc32, verifyCheckValue } from './crypto.ts';
@@ -103,9 +103,9 @@ const verifyingPassthrough = (
  * is relative to that reader and is corrected when the volume uses encrypted
  * block headers.
  */
-export interface VolumeBlock {
+export interface Rar5VolumeBlock {
 	reader: Reader;
-	block: import('./block.ts').Rar5Block;
+	block: Rar5Block;
 }
 
 // reads the header bytes of one block starting at `offset`, returning the
@@ -171,7 +171,7 @@ const readHeaderFrame = async (
 async function* walkVolume(
 	reader: Reader,
 	keys: KeyCache | undefined,
-): AsyncGenerator<VolumeBlock> {
+): AsyncGenerator<Rar5VolumeBlock> {
 	const signature = await readBytes(reader, 0, RAR5_SIGNATURE.length);
 	for (let idx = 0; idx < RAR5_SIGNATURE.length; idx++) {
 		if (signature[idx] !== RAR5_SIGNATURE[idx]) {
@@ -226,20 +226,10 @@ async function* walkVolume(
 async function* walkVolumes(
 	readers: readonly Reader[],
 	keys: KeyCache | undefined,
-): AsyncGenerator<VolumeBlock> {
+): AsyncGenerator<Rar5VolumeBlock> {
 	for (const reader of readers) {
 		yield* walkVolume(reader, keys);
 	}
-}
-
-/** options shared by archive walkers. */
-export interface WalkOptions {
-	/**
-	 * the password used to decrypt encrypted block headers. derivation is
-	 * cached per (salt, KDF count) pair, so the work runs once for an archive
-	 * even when many headers are encrypted.
-	 */
-	password?: string;
 }
 
 /**
@@ -254,10 +244,10 @@ export interface WalkOptions {
  * @returns async generator yielding every block, with `block.dataOffset`
  * corrected for the on-disk header frame size
  */
-export const walkArchive = (
+export const walkRar5Archive = (
 	source: Reader | readonly Reader[],
 	options?: WalkOptions,
-): AsyncGenerator<VolumeBlock> => {
+): AsyncGenerator<Rar5VolumeBlock> => {
 	const readers: readonly Reader[] = Array.isArray(source) ? source : [source];
 	const keys = options?.password !== undefined ? new KeyCache(options.password) : undefined;
 	return walkVolumes(readers, keys);

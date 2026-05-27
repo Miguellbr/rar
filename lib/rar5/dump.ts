@@ -1,11 +1,12 @@
 import { read, textDecoder } from '../utils/buffer.ts';
 
+import type { WalkOptions } from '../options.ts';
 import type { Reader } from '../reader/types.ts';
 import type { FileBlock, RarTime } from './block.ts';
 import { isDirectory, isFile, isSymlink } from './block.ts';
 import { BlockFlag, FileEncryptionFlag } from './constants.ts';
 import { decryptAesCbcStream, KeyCache, verifyCheckValue } from './crypto.ts';
-import { walkArchive, type WalkOptions } from './extract.ts';
+import { walkRar5Archive } from './extract.ts';
 
 /**
  * @module
@@ -409,7 +410,7 @@ export const dumpArchive = async (
 	// applies here; the cache makes sure we don't repeat that work.
 	const keys = options?.password !== undefined ? new KeyCache(options.password) : undefined;
 
-	for await (const { reader, block } of walkArchive(source, options)) {
+	for await (const { reader, block } of walkRar5Archive(source, options)) {
 		if (block.kind === 'main' && firstMain === undefined) {
 			firstMain = { volumeNumber: block.volumeNumber };
 			// a lone middle volume of a multi-volume set should print the same
