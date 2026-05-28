@@ -1,6 +1,7 @@
 /**
  * @module
- * This module contains Node.js-specific functions
+ *
+ * {@link Reader} factories that wrap Node.js runtime APIs.
  */
 
 import type { FileHandle } from 'node:fs/promises';

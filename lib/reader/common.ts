@@ -63,14 +63,17 @@ export function fromFile(blob: Blob): Reader {
 	};
 }
 
+/** options for {@link fromFetch}. */
 export interface FetchReaderOptions {
+	/** URL or Request to fetch from. */
 	input: string | URL | Request;
+	/** custom fetch implementation; defaults to the global `fetch`. */
 	fetch?: typeof fetch;
 }
 
 /**
- * creates a reader from a fetch URL or Request
- * @param input URL string or Request object to fetch from
+ * creates a reader backed by ranged HTTP fetches against a remote resource.
+ * @param opts URL or Request to fetch from, plus an optional fetch override
  * @returns a reader for the remote resource
  */
 export async function fromFetch(opts: FetchReaderOptions): Promise<Reader> {

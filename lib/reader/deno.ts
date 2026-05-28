@@ -1,6 +1,7 @@
 /**
  * @module
- * This module contains Deno-specific functions
+ *
+ * {@link Reader} factories that wrap Deno runtime APIs.
  */
 
 import Mutex from '@mary/mutex';
