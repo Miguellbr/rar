@@ -9,8 +9,10 @@ import {
 import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
 import { crc32 } from '../utils/crc32.ts';
 import {
+	crc32Verifier,
 	type DataSegment,
 	deferStream,
+	type IntegrityVerifier,
 	readBytes,
 	streamSegments,
 	verifyingPassthrough,
@@ -19,10 +21,18 @@ import { StreamReader } from '../utils/stream-reader.ts';
 
 import type { UnrarOptions, WalkOptions } from '../options.ts';
 import type { Reader } from '../reader/types.ts';
+import { Blake2sp } from './blake2.ts';
 import type { FileBlock, FileEncryption, Rar5Block } from './block.ts';
 import { isDirectory, isSymlink, parseBlock } from './block.ts';
-import { BlockFlag, COMPRESSION_SOLID, FileEncryptionFlag, RAR5_SIGNATURE } from './constants.ts';
-import { decryptAesCbc, decryptAesCbcStream, KeyCache, tweakCrc32, verifyCheckValue } from './crypto.ts';
+import { BlockFlag, COMPRESSION_SOLID, FileEncryptionFlag, HashType, RAR5_SIGNATURE } from './constants.ts';
+import {
+	decryptAesCbc,
+	decryptAesCbcStream,
+	KeyCache,
+	tweakBlake2sp,
+	tweakCrc32,
+	verifyCheckValue,
+} from './crypto.ts';
 import { Cursor } from './cursor.ts';
 import { Rar5Decoder } from './unpack.ts';
 
@@ -34,6 +44,54 @@ import { Rar5Decoder } from './unpack.ts';
  * for multi-volume archives stitches a file's data segments across volumes
  * into a single logical entry.
  */
+
+// constant-time byte comparison would be overkill — these are checksum bytes
+// against a value sitting in the archive header, so an attacker who controls
+// the archive controls both sides of the comparison. plain equality suffices.
+const bytesEqual = (a: Uint8Array, b: Uint8Array): boolean => {
+	if (a.length !== b.length) {
+		return false;
+	}
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) {
+			return false;
+		}
+	}
+	return true;
+};
+
+// builds a streaming verifier for the unencrypted-stored body fast path:
+// returns whichever of CRC32 / BLAKE2sp the entry records, or undefined when
+// neither is present. tweak transforms never apply here — the fast path only
+// runs for unencrypted entries.
+const blake2spVerifier = (
+	entryName: string,
+	expectedSize: number,
+	expectedDigest: Uint8Array,
+): IntegrityVerifier => {
+	const hasher = new Blake2sp();
+	return {
+		update(chunk) {
+			hasher.update(chunk);
+		},
+		finalize(received) {
+			if (received !== expectedSize) {
+				throw new ChecksumMismatchError(
+					`stored data size mismatch: got ${received} bytes, expected ${expectedSize}` +
+						` (entry ${entryName})`,
+				);
+			}
+			const computed = hasher.digest();
+			if (!bytesEqual(computed, expectedDigest)) {
+				throw new ChecksumMismatchError(
+					`BLAKE2sp mismatch: ` +
+						`stored ${expectedDigest.toHex()}, computed ${computed.toHex()}` +
+						` (entry ${entryName})`,
+				);
+			}
+		},
+	};
+};
 
 /**
  * a parsed block paired with the volume reader it came from; `block.dataOffset`
@@ -340,6 +398,21 @@ export class Rar5Entry {
 		return this.#head.attributes;
 	}
 
+	// picks the verifier the body fast path runs against the raw segment
+	// stream. only invoked for unencrypted stored entries, so tweak transforms
+	// do not apply here — both factories build plain (un-tweaked) verifiers.
+	#bodyVerifier(): IntegrityVerifier | undefined {
+		const head = this.#head;
+		const recorded = head.hash;
+		if (recorded !== undefined && recorded.type === HashType.blake2sp) {
+			return blake2spVerifier(head.name, head.unpackedSize, recorded.value);
+		}
+		if (this.#finalCrc !== undefined) {
+			return crc32Verifier(head.name, head.unpackedSize, this.#finalCrc);
+		}
+		return undefined;
+	}
+
 	// runs the one decode pass for this entry on first consumption and caches
 	// the resulting chunks; every later body/bytes/_drain call replays from the
 	// cache. for an entry with a shared solid-run decoder, the iterator awaits
@@ -372,7 +445,7 @@ export class Rar5Entry {
 				)
 				: streamSegments(this.#segments);
 			const result = await read(source, expected);
-			await this.#verifyCrc32([result]);
+			await this.#verifyHash([result]);
 			return [result];
 		}
 
@@ -384,15 +457,43 @@ export class Rar5Entry {
 		await this.#decoder.decode(reader, expected, (chunk) => {
 			chunks.push(chunk);
 		});
-		await this.#verifyCrc32(chunks);
+		await this.#verifyHash(chunks);
 		return chunks;
 	}
 
-	// verifies the recorded CRC32 against the decoded plaintext, applying the
-	// TWEAKED transform for encrypted entries when set. silent when no CRC is
-	// recorded (e.g. blake-hashed entries) so callers that rely on that branch
-	// still see a clean read.
-	async #verifyCrc32(chunks: readonly Uint8Array<ArrayBuffer>[]): Promise<void> {
+	// verifies the entry's recorded integrity tag against the decoded plaintext:
+	// a BLAKE2sp hash record when present, otherwise the inline CRC32 (when the
+	// header carries one). encrypted entries with the TWEAKED checksum flag
+	// have their computed value run through the entry's HMAC key before
+	// comparison. silent when neither tag is recorded so old archives without
+	// an inline CRC still read cleanly.
+	async #verifyHash(chunks: readonly Uint8Array<ArrayBuffer>[]): Promise<void> {
+		const encryption = this.#head.encryption;
+		const tweaked = encryption !== undefined &&
+			(encryption.flags & FileEncryptionFlag.tweakedChecksums) !== 0 &&
+			this.#keys !== undefined;
+
+		const recorded = this.#head.hash;
+		if (recorded !== undefined && recorded.type === HashType.blake2sp) {
+			const hasher = new Blake2sp();
+			for (const chunk of chunks) {
+				hasher.update(chunk);
+			}
+			let computed: Uint8Array<ArrayBuffer> = hasher.digest();
+			if (tweaked) {
+				const { derived } = await this.#keys!.get(encryption!.salt, encryption!.kdfCount);
+				computed = await tweakBlake2sp(derived.hmacKey, computed);
+			}
+			if (!bytesEqual(computed, recorded.value)) {
+				throw new ChecksumMismatchError(
+					`BLAKE2sp mismatch: ` +
+						`stored ${recorded.value.toHex()}, computed ${computed.toHex()}` +
+						` (entry ${this.#head.name})`,
+				);
+			}
+			return;
+		}
+
 		const stored = this.#finalCrc;
 		if (stored === undefined) {
 			return;
@@ -404,13 +505,8 @@ export class Rar5Entry {
 		}
 
 		let expected = computed;
-		const encryption = this.#head.encryption;
-		if (
-			encryption !== undefined &&
-			(encryption.flags & FileEncryptionFlag.tweakedChecksums) !== 0 &&
-			this.#keys !== undefined
-		) {
-			const { derived } = await this.#keys.get(encryption.salt, encryption.kdfCount);
+		if (tweaked) {
+			const { derived } = await this.#keys!.get(encryption!.salt, encryption!.kdfCount);
 			expected = await tweakCrc32(derived.hmacKey, computed);
 		}
 
@@ -469,17 +565,14 @@ export class Rar5Entry {
 		// an unencrypted stored entry can stream segment by segment without
 		// going through the decoder. once its chunks have been cached elsewhere
 		// (e.g. by bytes()), the cache path is cheaper. the passthrough wraps
-		// the raw stream so the body call still verifies CRC32 — without it,
-		// silently-corrupted bytes would slip through while bytes() catches them.
+		// the raw stream so the body call still verifies the entry's recorded
+		// hash — without it, silently-corrupted bytes would slip through while
+		// bytes() catches them.
 		if (
 			this.#decoder === undefined && this.#chunks === undefined &&
 			this.#head.encryption === undefined
 		) {
-			return verifyingPassthrough(streamSegments(this.#segments), {
-				entryName: this.#head.name,
-				expectedCrc: this.#finalCrc,
-				expectedSize: this.#head.unpackedSize,
-			});
+			return verifyingPassthrough(streamSegments(this.#segments), this.#bodyVerifier());
 		}
 
 		return deferStream(async () => {

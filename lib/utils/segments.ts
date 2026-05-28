@@ -167,37 +167,47 @@ export const streamSegments = (
 };
 
 /**
- * wraps `source` so every byte it emits is accumulated into a running CRC32
- * and the total length is tracked. on clean close the wrapped stream errors
- * with a {@link ChecksumMismatchError} when the running CRC or received size
- * disagrees with `expectedCrc` / `expectedSize`. used by entry `body` getters
- * whose fast path streams archive bytes verbatim, so a streamed consumer
- * gets the same integrity guarantee as one going through the buffered decode
- * + `#verifyCrc32` path.
+ * an incremental integrity check fed one chunk at a time. {@link finalize}
+ * runs the comparison after the last byte is seen and throws a
+ * {@link ChecksumMismatchError} on mismatch. used by {@link verifyingPassthrough}
+ * to validate the stored fast-path body stream of an entry, and by entry
+ * decode paths to validate the chunked output before returning it.
+ */
+export interface IntegrityVerifier {
+	update(chunk: Uint8Array<ArrayBuffer>): void;
+	/**
+	 * called once after the last chunk; compares the accumulated state and
+	 * the received byte count against the entry's recorded values.
+	 *
+	 * @param receivedSize the total number of bytes fed via {@link update}
+	 * @throws ChecksumMismatchError when size or hash disagree
+	 */
+	finalize(receivedSize: number): void;
+}
+
+/**
+ * wraps `source` so every emitted chunk is fed to `verifier`, and the
+ * verifier's `finalize` is called when the source closes. used by entry
+ * `body` getters whose fast path streams archive bytes verbatim, so a
+ * streamed consumer gets the same integrity guarantee as one going through
+ * a buffered decode + finalize path.
  *
- * when `expectedCrc` is `undefined` — e.g. a RAR5 entry that records a
- * BLAKE2sp hash instead of a CRC32 — the source is returned unchanged.
+ * when `verifier` is `undefined` — e.g. an entry that records neither a
+ * CRC32 nor a hash — the source is returned unchanged.
  *
  * @param source the byte stream to verify
- * @param options expected CRC32 (or `undefined` to skip), expected total
- * length, and the entry name surfaced in error messages
+ * @param verifier an incremental verifier, or `undefined` to skip
  * @returns a stream that pipes `source` and validates on close
  */
 export const verifyingPassthrough = (
 	source: ReadableStream<Uint8Array<ArrayBuffer>>,
-	options: {
-		entryName: string;
-		expectedCrc: number | undefined;
-		expectedSize: number;
-	},
+	verifier: IntegrityVerifier | undefined,
 ): ReadableStream<Uint8Array<ArrayBuffer>> => {
-	if (options.expectedCrc === undefined) {
+	if (verifier === undefined) {
 		return source;
 	}
-	const { entryName, expectedCrc, expectedSize } = options;
 
 	let reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>> | undefined;
-	let computed = 0;
 	let received = 0;
 	let cancelled = false;
 
@@ -213,31 +223,17 @@ export const verifyingPassthrough = (
 
 			const { done, value } = await reader.read();
 			if (done) {
-				if (received !== expectedSize) {
-					controller.error(
-						new ChecksumMismatchError(
-							`stored data size mismatch: got ${received} bytes, expected ${expectedSize}` +
-								` (entry ${entryName})`,
-						),
-					);
-					return;
-				}
-				if (computed !== expectedCrc) {
-					controller.error(
-						new ChecksumMismatchError(
-							`CRC32 mismatch: ` +
-								`stored 0x${expectedCrc.toString(16).padStart(8, '0')}, ` +
-								`computed 0x${computed.toString(16).padStart(8, '0')}` +
-								` (entry ${entryName})`,
-						),
-					);
+				try {
+					verifier.finalize(received);
+				} catch (error) {
+					controller.error(error);
 					return;
 				}
 				controller.close();
 				return;
 			}
 
-			computed = crc32(value, computed);
+			verifier.update(value);
 			received += value.length;
 			controller.enqueue(value);
 		},
@@ -246,4 +242,42 @@ export const verifyingPassthrough = (
 			await reader?.cancel(reason);
 		},
 	});
+};
+
+/**
+ * builds an {@link IntegrityVerifier} that accumulates a running CRC32 and
+ * checks both the expected size and the expected CRC at finalization.
+ *
+ * @param entryName entry name surfaced in error messages
+ * @param expectedSize the total byte count the stream should deliver
+ * @param expectedCrc the stored CRC32 to compare against
+ * @returns a verifier that throws on size or CRC mismatch
+ */
+export const crc32Verifier = (
+	entryName: string,
+	expectedSize: number,
+	expectedCrc: number,
+): IntegrityVerifier => {
+	let computed = 0;
+	return {
+		update(chunk) {
+			computed = crc32(chunk, computed);
+		},
+		finalize(received) {
+			if (received !== expectedSize) {
+				throw new ChecksumMismatchError(
+					`stored data size mismatch: got ${received} bytes, expected ${expectedSize}` +
+						` (entry ${entryName})`,
+				);
+			}
+			if (computed !== expectedCrc) {
+				throw new ChecksumMismatchError(
+					`CRC32 mismatch: ` +
+						`stored 0x${expectedCrc.toString(16).padStart(8, '0')}, ` +
+						`computed 0x${computed.toString(16).padStart(8, '0')}` +
+						` (entry ${entryName})`,
+				);
+			}
+		},
+	};
 };

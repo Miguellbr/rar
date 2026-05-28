@@ -227,6 +227,29 @@ export const tweakCrc32 = async (
 	return tweaked >>> 0;
 };
 
+/**
+ * transforms a plaintext BLAKE2sp-256 digest into the MAC stored in an
+ * encrypted entry's header when the TWEAKED checksum flag is set: the 32-byte
+ * HMAC-SHA256 of the digest under the entry's HMAC key.
+ *
+ * @param hmacKey the 32-byte tweak HMAC key from {@link deriveKeys}
+ * @param plainDigest the BLAKE2sp-256 hash of the entry's plaintext
+ * @returns the tweaked digest, as it appears in the archive header
+ */
+export const tweakBlake2sp = async (
+	hmacKey: Uint8Array<ArrayBuffer>,
+	plainDigest: Uint8Array<ArrayBuffer>,
+): Promise<Uint8Array<ArrayBuffer>> => {
+	const key = await crypto.subtle.importKey(
+		'raw',
+		hmacKey,
+		{ hash: 'SHA-256', name: 'HMAC' },
+		false,
+		['sign'],
+	);
+	return new Uint8Array(await crypto.subtle.sign('HMAC', key, plainDigest));
+};
+
 // decrypts one CBC batch of `B` aligned bytes by appending a synthetic
 // PKCS#7-padded block so Web Crypto, which only does padded AES-CBC, returns
 // exactly `B` plaintext bytes. the synthetic block is `encrypt(empty)` keyed

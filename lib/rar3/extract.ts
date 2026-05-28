@@ -9,6 +9,7 @@ import {
 import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
 import { crc32 } from '../utils/crc32.ts';
 import {
+	crc32Verifier,
 	type DataSegment,
 	deferStream,
 	readBytes,
@@ -351,11 +352,10 @@ export class Rar3Entry {
 		// catches a CRC32 / size mismatch — bytes() catches it via #verifyCrc32.
 		const cacheable = this.isEncrypted || this.#head.method !== CompressMethod.stored;
 		if (!cacheable && this.#chunks === undefined) {
-			return verifyingPassthrough(streamSegments(this.#segments), {
-				entryName: this.filename,
-				expectedCrc: this.#finalCrc,
-				expectedSize: this.#head.unpackedSize,
-			});
+			return verifyingPassthrough(
+				streamSegments(this.#segments),
+				crc32Verifier(this.filename, this.#head.unpackedSize, this.#finalCrc),
+			);
 		}
 
 		return deferStream(async () => {
