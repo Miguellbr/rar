@@ -1369,7 +1369,23 @@ export class Rar3Decoder {
 		// follow-up solid entry begins at a clean bit position. the
 		// write-overflow check at the top guards against malformed archives
 		// that emit literals past the declared size.
+		//
+		// the outer `while` body does the async work (refill, flush, parseCodes,
+		// PPMd setup, filter command). once those gates pass, an inner `for (;;)`
+		// runs the LZSS symbol loop synchronously until the bit-reader slab
+		// drops below the 16-byte cushion, the flush threshold is reached, or a
+		// special symbol (256 end / 257 filter) needs async help. keeping the
+		// inner loop sync removes a per-symbol resolved-promise await from the
+		// hottest path in the decoder.
 		let endMarkerSeen = false;
+		let pendingFilter = false;
+		// tail-of-stream mode. when `ensureBytes(16)` returns true but the bit
+		// reader still has fewer than 16 bytes of margin (the underlying input
+		// was exhausted before refill could reach the comfortable cushion), we
+		// drop the 16-byte invariant for the sync inner and decode one symbol
+		// at a time off the PAD-zero cushion until either the entry's end-marker
+		// is consumed or the bits truly run dry.
+		let inputExhausted = false;
 		while (!endMarkerSeen) {
 			if (this.#write > targetWrite) {
 				throw new ChecksumMismatchError(`RAR3 wrote past expected size: ${unpackedSize} bytes`);
@@ -1382,8 +1398,33 @@ export class Rar3Decoder {
 				await flush(false);
 			}
 
-			if (!await ensureBytes(16)) {
-				// no more input — the caller validates write < targetWrite below.
+			if (pendingFilter) {
+				await parseFilterCommand(
+					bits!,
+					this.#filterState,
+					this.#write,
+					this.#targetSize,
+					ensureBytesOrThrow,
+				);
+				pendingFilter = false;
+				inputExhausted = bits!.addr + 16 > bits!.data.length - PAD;
+				continue;
+			}
+
+			if (!inputExhausted) {
+				if (!await ensureBytes(16)) {
+					// no more input — the caller validates write < targetWrite below.
+					break;
+				}
+				// case B: ensureBytes returned true but the bit reader is still
+				// short of the 16-byte cushion (input is dry). switch to tail
+				// mode for any subsequent inner pass.
+				if (bits!.addr + 16 > bits!.data.length - PAD) {
+					inputExhausted = true;
+				}
+			} else if (bits!.addr + 5 > bits!.data.length) {
+				// tail mode: bits actually empty, mirroring ensureBytes' false
+				// return condition.
 				break;
 			}
 
@@ -1513,143 +1554,168 @@ export class Rar3Decoder {
 			}
 
 			const tables = this.#tables!;
+			const mainTable = tables.main;
+			const lengthHuff = tables.length;
+			const offsetHuff = tables.offset;
+			const lowOffsetHuff = tables.lowOffset;
 
-			const symbol = decodeSymbol(tables.main, bits!);
-
-			if (symbol < 256) {
-				window[this.#write++ & mask] = symbol;
-				continue;
-			}
-
-			if (symbol === 256) {
-				const newFile = bits!.read(1) === 0;
-				if (newFile) {
-					// end-of-entry marker: the next bit decides whether the next
-					// entry rebuilds Huffman tables or carries the current set
-					// over (solid runs typically carry).
-					this.#startNewTable = bits!.read(1) !== 0;
-					endMarkerSeen = true;
-					break;
+			// sync inner loop. exits when:
+			// - bits margin drops below 16 (refill)
+			// - flush threshold reached
+			// - symbol 256 (end-of-entry; possibly with in-stream table refresh)
+			// - symbol 257 (async filter command)
+			// - write overruns targetWrite (malformed archive)
+			//
+			// `peek16` looks 3 bytes ahead, every read inside is bounded by 16
+			// bits, and the worst-case composite read (length symbol + extras +
+			// offset symbol + extras + low-offset symbol) tops out at well under
+			// 16 bytes — the same cushion the original loop maintained via
+			// `await ensureBytes(16)`.
+			syncDecode: for (;;) {
+				if (this.#write > targetWrite) {
+					throw new ChecksumMismatchError(`RAR3 wrote past expected size: ${unpackedSize} bytes`);
 				}
-				// in-stream table change: re-parse codes against the same length
-				// table and keep decoding from the new tables.
-				const refreshed = parseCodes(bits!, this.#lengthTable);
-				if (refreshed.kind !== 'huffman') {
-					throw new MalformedArchiveError(
-						'RAR3 in-stream table refresh switched to PPMd unexpectedly',
-					);
+				if (this.#write - emitted >= FLUSH_HIGH_WATER) {
+					break syncDecode;
 				}
-				this.#tables = refreshed.tables;
-				continue;
-			}
+				if (inputExhausted) {
+					if (bits!.addr + 5 > bits!.data.length) {
+						break syncDecode;
+					}
+				} else if (bits!.addr + 16 > bits!.data.length - PAD) {
+					break syncDecode;
+				}
 
-			if (symbol === 257) {
-				// parse the filter command off the bit stream and stage it on
-				// the decoder's filter stack; the queued filter will execute
-				// when the LZSS engine has produced enough output to cover
-				// its `[blockStart, blockStart + blockLength)` range.
-				await parseFilterCommand(
-					bits!,
-					this.#filterState,
-					this.#write,
-					this.#targetSize,
-					ensureBytesOrThrow,
-				);
-				continue;
-			}
+				const symbol = decodeSymbol(mainTable, bits!);
 
-			let offs: number;
-			let len: number;
-
-			if (symbol === 258) {
-				if (this.#lastLength === 0) {
+				if (symbol < 256) {
+					window[this.#write++ & mask] = symbol;
 					continue;
 				}
-				offs = this.#lastOffset;
-				len = this.#lastLength;
-			} else if (symbol < 263) {
-				const offsetIndex = symbol - 259;
-				offs = this.#oldOffsets[offsetIndex];
-				const lengthSymbol = decodeSymbol(tables.length, bits!);
-				if (lengthSymbol >= LENGTH_BASES.length) {
-					throw new MalformedArchiveError(`RAR3 length symbol out of range: ${lengthSymbol}`);
-				}
-				len = LENGTH_BASES[lengthSymbol] + 2;
-				if (LENGTH_EXTRA_BITS[lengthSymbol] > 0) {
-					len += bits!.read(LENGTH_EXTRA_BITS[lengthSymbol]);
-				}
-				for (let i = offsetIndex; i > 0; i--) {
-					this.#oldOffsets[i] = this.#oldOffsets[i - 1];
-				}
-				this.#oldOffsets[0] = offs;
-			} else if (symbol < 271) {
-				const slot = symbol - 263;
-				offs = SHORT_BASES[slot] + 1;
-				if (SHORT_EXTRA_BITS[slot] > 0) {
-					offs += bits!.read(SHORT_EXTRA_BITS[slot]);
-				}
-				len = 2;
-				for (let i = 3; i > 0; i--) {
-					this.#oldOffsets[i] = this.#oldOffsets[i - 1];
-				}
-				this.#oldOffsets[0] = offs;
-			} else {
-				const lengthSlot = symbol - 271;
-				if (lengthSlot >= LENGTH_BASES.length) {
-					throw new MalformedArchiveError(`RAR3 main symbol out of length range: ${symbol}`);
-				}
-				len = LENGTH_BASES[lengthSlot] + 3;
-				if (LENGTH_EXTRA_BITS[lengthSlot] > 0) {
-					len += bits!.read(LENGTH_EXTRA_BITS[lengthSlot]);
+
+				if (symbol === 256) {
+					const newFile = bits!.read(1) === 0;
+					if (newFile) {
+						// end-of-entry marker: the next bit decides whether the next
+						// entry rebuilds Huffman tables or carries the current set
+						// over (solid runs typically carry).
+						this.#startNewTable = bits!.read(1) !== 0;
+						endMarkerSeen = true;
+						break syncDecode;
+					}
+					// in-stream table change: re-parse codes against the same length
+					// table and keep decoding from the new tables. break out of the
+					// inner loop so the outer can refresh the table-local references.
+					const refreshed = parseCodes(bits!, this.#lengthTable);
+					if (refreshed.kind !== 'huffman') {
+						throw new MalformedArchiveError(
+							'RAR3 in-stream table refresh switched to PPMd unexpectedly',
+						);
+					}
+					this.#tables = refreshed.tables;
+					break syncDecode;
 				}
 
-				const offsetSymbol = decodeSymbol(tables.offset, bits!);
-				if (offsetSymbol >= OFFSET_BASES.length) {
-					throw new MalformedArchiveError(`RAR3 offset symbol out of range: ${offsetSymbol}`);
+				if (symbol === 257) {
+					// filter command bodies can span ~65 KiB and need their own
+					// ensureBytes refills; defer to the async outer.
+					pendingFilter = true;
+					break syncDecode;
 				}
-				offs = OFFSET_BASES[offsetSymbol] + 1;
-				const extraBits = OFFSET_EXTRA_BITS[offsetSymbol];
-				if (extraBits > 0) {
-					if (offsetSymbol > 9) {
-						if (extraBits > 4) {
-							offs += bits!.read(extraBits - 4) << 4;
-						}
-						if (this.#lowOffsetRepeats > 0) {
-							this.#lowOffsetRepeats--;
-							offs += this.#lastLowOffset;
-						} else {
-							const lowSymbol = decodeSymbol(tables.lowOffset, bits!);
-							if (lowSymbol === 16) {
-								this.#lowOffsetRepeats = 15;
+
+				let offs: number;
+				let len: number;
+
+				if (symbol === 258) {
+					if (this.#lastLength === 0) {
+						continue;
+					}
+					offs = this.#lastOffset;
+					len = this.#lastLength;
+				} else if (symbol < 263) {
+					const offsetIndex = symbol - 259;
+					offs = this.#oldOffsets[offsetIndex];
+					const lengthSymbol = decodeSymbol(lengthHuff, bits!);
+					if (lengthSymbol >= LENGTH_BASES.length) {
+						throw new MalformedArchiveError(`RAR3 length symbol out of range: ${lengthSymbol}`);
+					}
+					len = LENGTH_BASES[lengthSymbol] + 2;
+					if (LENGTH_EXTRA_BITS[lengthSymbol] > 0) {
+						len += bits!.read(LENGTH_EXTRA_BITS[lengthSymbol]);
+					}
+					for (let i = offsetIndex; i > 0; i--) {
+						this.#oldOffsets[i] = this.#oldOffsets[i - 1];
+					}
+					this.#oldOffsets[0] = offs;
+				} else if (symbol < 271) {
+					const slot = symbol - 263;
+					offs = SHORT_BASES[slot] + 1;
+					if (SHORT_EXTRA_BITS[slot] > 0) {
+						offs += bits!.read(SHORT_EXTRA_BITS[slot]);
+					}
+					len = 2;
+					for (let i = 3; i > 0; i--) {
+						this.#oldOffsets[i] = this.#oldOffsets[i - 1];
+					}
+					this.#oldOffsets[0] = offs;
+				} else {
+					const lengthSlot = symbol - 271;
+					if (lengthSlot >= LENGTH_BASES.length) {
+						throw new MalformedArchiveError(`RAR3 main symbol out of length range: ${symbol}`);
+					}
+					len = LENGTH_BASES[lengthSlot] + 3;
+					if (LENGTH_EXTRA_BITS[lengthSlot] > 0) {
+						len += bits!.read(LENGTH_EXTRA_BITS[lengthSlot]);
+					}
+
+					const offsetSymbol = decodeSymbol(offsetHuff, bits!);
+					if (offsetSymbol >= OFFSET_BASES.length) {
+						throw new MalformedArchiveError(`RAR3 offset symbol out of range: ${offsetSymbol}`);
+					}
+					offs = OFFSET_BASES[offsetSymbol] + 1;
+					const extraBits = OFFSET_EXTRA_BITS[offsetSymbol];
+					if (extraBits > 0) {
+						if (offsetSymbol > 9) {
+							if (extraBits > 4) {
+								offs += bits!.read(extraBits - 4) << 4;
+							}
+							if (this.#lowOffsetRepeats > 0) {
+								this.#lowOffsetRepeats--;
 								offs += this.#lastLowOffset;
 							} else {
-								offs += lowSymbol;
-								this.#lastLowOffset = lowSymbol;
+								const lowSymbol = decodeSymbol(lowOffsetHuff, bits!);
+								if (lowSymbol === 16) {
+									this.#lowOffsetRepeats = 15;
+									offs += this.#lastLowOffset;
+								} else {
+									offs += lowSymbol;
+									this.#lastLowOffset = lowSymbol;
+								}
 							}
+						} else {
+							offs += bits!.read(extraBits);
 						}
-					} else {
-						offs += bits!.read(extraBits);
 					}
+
+					// libarchive: long-distance matches encode shorter length codes,
+					// so bump the decoded length back up for the appropriate slots.
+					if (offs >= 0x40000) {
+						len++;
+					}
+					if (offs >= 0x2000) {
+						len++;
+					}
+
+					for (let i = 3; i > 0; i--) {
+						this.#oldOffsets[i] = this.#oldOffsets[i - 1];
+					}
+					this.#oldOffsets[0] = offs;
 				}
 
-				// libarchive: long-distance matches encode shorter length codes,
-				// so bump the decoded length back up for the appropriate slots.
-				if (offs >= 0x40000) {
-					len++;
-				}
-				if (offs >= 0x2000) {
-					len++;
-				}
-
-				for (let i = 3; i > 0; i--) {
-					this.#oldOffsets[i] = this.#oldOffsets[i - 1];
-				}
-				this.#oldOffsets[0] = offs;
+				this.#lastOffset = offs;
+				this.#lastLength = len;
+				copy(len, offs);
 			}
-
-			this.#lastOffset = offs;
-			this.#lastLength = len;
-			copy(len, offs);
 		}
 
 		await flush(true);
