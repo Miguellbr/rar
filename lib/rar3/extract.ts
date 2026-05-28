@@ -1,4 +1,5 @@
 import {
+	ChecksumMismatchError,
 	InvalidSignatureError,
 	MalformedArchiveError,
 	MissingPasswordError,
@@ -6,7 +7,14 @@ import {
 	TruncatedArchiveError,
 } from '../errors.ts';
 import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
-import { type DataSegment, deferStream, readBytes, streamSegments } from '../utils/segments.ts';
+import { crc32 } from '../utils/crc32.ts';
+import {
+	type DataSegment,
+	deferStream,
+	readBytes,
+	streamSegments,
+	verifyingPassthrough,
+} from '../utils/segments.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
 
 import type { UnrarOptions, WalkOptions } from '../options.ts';
@@ -278,7 +286,9 @@ export class Rar3Entry {
 					this.#segments[0].size,
 				)
 				: streamSegments(this.#segments);
-			return [await read(source, expected)];
+			const chunks = [await read(source, expected)];
+			this.#verifyCrc32(chunks);
+			return chunks;
 		}
 
 		const ciphertext = streamSegments(this.#segments);
@@ -303,7 +313,27 @@ export class Rar3Entry {
 		await this.#decoder.decode(reader, expected, (chunk) => {
 			chunks.push(chunk);
 		});
+		this.#verifyCrc32(chunks);
 		return chunks;
+	}
+
+	// verifies the stored CRC32 against the decoded plaintext. for a split
+	// entry RAR3 records the full file CRC in the final part's header (the
+	// value carried as #finalCrc), so a running CRC across every chunk lines
+	// up with what we expect.
+	#verifyCrc32(chunks: readonly Uint8Array<ArrayBuffer>[]): void {
+		let computed = 0;
+		for (const chunk of chunks) {
+			computed = crc32(chunk, computed);
+		}
+		if (computed !== this.#finalCrc) {
+			throw new ChecksumMismatchError(
+				`CRC32 mismatch: ` +
+					`stored 0x${this.#finalCrc.toString(16).padStart(8, '0')}, ` +
+					`computed 0x${computed.toString(16).padStart(8, '0')}` +
+					` (entry ${this.filename})`,
+			);
+		}
 	}
 
 	/**
@@ -317,9 +347,15 @@ export class Rar3Entry {
 	get body(): ReadableStream<Uint8Array> {
 		// fast path: an unencrypted stored entry that has not yet been consumed
 		// elsewhere can stream straight from segments without holding a cache.
+		// the passthrough wraps the raw stream so a streamed consumer still
+		// catches a CRC32 / size mismatch — bytes() catches it via #verifyCrc32.
 		const cacheable = this.isEncrypted || this.#head.method !== CompressMethod.stored;
 		if (!cacheable && this.#chunks === undefined) {
-			return streamSegments(this.#segments);
+			return verifyingPassthrough(streamSegments(this.#segments), {
+				entryName: this.filename,
+				expectedCrc: this.#finalCrc,
+				expectedSize: this.#head.unpackedSize,
+			});
 		}
 
 		return deferStream(async () => {

@@ -1,6 +1,8 @@
+import { ChecksumMismatchError } from '../errors.ts';
 import type { Reader } from '../reader/types.ts';
 
 import { read } from './buffer.ts';
+import { crc32 } from './crc32.ts';
 
 /**
  * @module
@@ -160,6 +162,88 @@ export const streamSegments = (
 			cancelled = true;
 			cancelReason = reason;
 			await current?.cancel(reason);
+		},
+	});
+};
+
+/**
+ * wraps `source` so every byte it emits is accumulated into a running CRC32
+ * and the total length is tracked. on clean close the wrapped stream errors
+ * with a {@link ChecksumMismatchError} when the running CRC or received size
+ * disagrees with `expectedCrc` / `expectedSize`. used by entry `body` getters
+ * whose fast path streams archive bytes verbatim, so a streamed consumer
+ * gets the same integrity guarantee as one going through the buffered decode
+ * + `#verifyCrc32` path.
+ *
+ * when `expectedCrc` is `undefined` — e.g. a RAR5 entry that records a
+ * BLAKE2sp hash instead of a CRC32 — the source is returned unchanged.
+ *
+ * @param source the byte stream to verify
+ * @param options expected CRC32 (or `undefined` to skip), expected total
+ * length, and the entry name surfaced in error messages
+ * @returns a stream that pipes `source` and validates on close
+ */
+export const verifyingPassthrough = (
+	source: ReadableStream<Uint8Array<ArrayBuffer>>,
+	options: {
+		entryName: string;
+		expectedCrc: number | undefined;
+		expectedSize: number;
+	},
+): ReadableStream<Uint8Array<ArrayBuffer>> => {
+	if (options.expectedCrc === undefined) {
+		return source;
+	}
+	const { entryName, expectedCrc, expectedSize } = options;
+
+	let reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>> | undefined;
+	let computed = 0;
+	let received = 0;
+	let cancelled = false;
+
+	return new ReadableStream({
+		async pull(controller) {
+			if (reader === undefined) {
+				if (cancelled) {
+					controller.close();
+					return;
+				}
+				reader = source.getReader();
+			}
+
+			const { done, value } = await reader.read();
+			if (done) {
+				if (received !== expectedSize) {
+					controller.error(
+						new ChecksumMismatchError(
+							`stored data size mismatch: got ${received} bytes, expected ${expectedSize}` +
+								` (entry ${entryName})`,
+						),
+					);
+					return;
+				}
+				if (computed !== expectedCrc) {
+					controller.error(
+						new ChecksumMismatchError(
+							`CRC32 mismatch: ` +
+								`stored 0x${expectedCrc.toString(16).padStart(8, '0')}, ` +
+								`computed 0x${computed.toString(16).padStart(8, '0')}` +
+								` (entry ${entryName})`,
+						),
+					);
+					return;
+				}
+				controller.close();
+				return;
+			}
+
+			computed = crc32(value, computed);
+			received += value.length;
+			controller.enqueue(value);
+		},
+		async cancel(reason) {
+			cancelled = true;
+			await reader?.cancel(reason);
 		},
 	});
 };

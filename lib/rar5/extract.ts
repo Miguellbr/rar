@@ -8,7 +8,13 @@ import {
 } from '../errors.ts';
 import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
 import { crc32 } from '../utils/crc32.ts';
-import { type DataSegment, deferStream, readBytes, streamSegments } from '../utils/segments.ts';
+import {
+	type DataSegment,
+	deferStream,
+	readBytes,
+	streamSegments,
+	verifyingPassthrough,
+} from '../utils/segments.ts';
 import { StreamReader } from '../utils/stream-reader.ts';
 
 import type { UnrarOptions, WalkOptions } from '../options.ts';
@@ -28,75 +34,6 @@ import { Rar5Decoder } from './unpack.ts';
  * for multi-volume archives stitches a file's data segments across volumes
  * into a single logical entry.
  */
-
-// wraps `source` in a stream that accumulates a CRC32 over every emitted byte
-// and surfaces a `crc32 mismatch` (or size-mismatch) error on clean close.
-// used by the body fast-path so a stored entry consumed via the streaming API
-// gets the same integrity guarantee as one read through bytes().
-const verifyingPassthrough = (
-	source: ReadableStream<Uint8Array<ArrayBuffer>>,
-	options: {
-		entryName: string;
-		expectedCrc: number | undefined;
-		expectedSize: number;
-	},
-): ReadableStream<Uint8Array<ArrayBuffer>> => {
-	if (options.expectedCrc === undefined) {
-		return source;
-	}
-	const { entryName, expectedCrc, expectedSize } = options;
-
-	let reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>> | undefined;
-	let computed = 0;
-	let received = 0;
-	let cancelled = false;
-
-	return new ReadableStream({
-		async pull(controller) {
-			if (reader === undefined) {
-				if (cancelled) {
-					controller.close();
-					return;
-				}
-				reader = source.getReader();
-			}
-
-			const { done, value } = await reader.read();
-			if (done) {
-				if (received !== expectedSize) {
-					controller.error(
-						new ChecksumMismatchError(
-							`stored data size mismatch: got ${received} bytes, expected ${expectedSize}` +
-								` (entry ${entryName})`,
-						),
-					);
-					return;
-				}
-				if (computed !== expectedCrc) {
-					controller.error(
-						new ChecksumMismatchError(
-							`CRC32 mismatch: ` +
-								`stored 0x${expectedCrc.toString(16).padStart(8, '0')}, ` +
-								`computed 0x${computed.toString(16).padStart(8, '0')}` +
-								` (entry ${entryName})`,
-						),
-					);
-					return;
-				}
-				controller.close();
-				return;
-			}
-
-			computed = crc32(value, computed);
-			received += value.length;
-			controller.enqueue(value);
-		},
-		async cancel(reason) {
-			cancelled = true;
-			await reader?.cancel(reason);
-		},
-	});
-};
 
 /**
  * a parsed block paired with the volume reader it came from; `block.dataOffset`
