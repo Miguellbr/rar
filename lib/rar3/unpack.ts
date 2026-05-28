@@ -242,29 +242,29 @@ const SHORT_EXTRA_BITS = new Uint8Array([2, 2, 3, 4, 5, 6, 6, 6]);
 // extends and rotate the byte position + intra-byte bit index in lockstep.
 // peek16/peek32 read up to 4 bytes ahead, so the backing buffer needs at
 // least 8 zero-padding bytes past the last meaningful byte.
+//
+// `data`, `addr`, and `bit` are public fields rather than private + getter so
+// the hot LZSS loop can lift them into local scalars and inline peek/skip
+// without going through a method call on every symbol.
 class BitReader {
-	#data: Uint8Array;
+	data: Uint8Array;
 	/** byte offset of the next unread bit */
 	addr = 0;
 	/** bit offset within that byte, 0 through 7 */
 	bit = 0;
 
 	constructor(data: Uint8Array) {
-		this.#data = data;
+		this.data = data;
 	}
 
 	/** swaps the backing buffer, keeping the current addr/bit position. */
 	rebind(data: Uint8Array): void {
-		this.#data = data;
-	}
-
-	get data(): Uint8Array {
-		return this.#data;
+		this.data = data;
 	}
 
 	/** the next 16 bits, without consuming them. */
 	peek16(): number {
-		const p = this.#data;
+		const p = this.data;
 		const a = this.addr;
 		const bits = (p[a] << 16) | (p[a + 1] << 8) | p[a + 2];
 		return (bits >>> (8 - this.bit)) & 0xffff;
@@ -272,7 +272,7 @@ class BitReader {
 
 	/** the next 32 bits, without consuming them. */
 	peek32(): number {
-		const p = this.#data;
+		const p = this.data;
 		const a = this.addr;
 		const bits = ((p[a] << 24) | (p[a + 1] << 16) | (p[a + 2] << 8) | p[a + 3]) >>> 0;
 		if (this.bit === 0) {
@@ -1650,11 +1650,28 @@ export class Rar3Decoder {
 			// offset symbol + extras + low-offset symbol) tops out at well under
 			// 16 bytes — the same cushion the original loop maintained via
 			// `await ensureBytes(16)`.
+			//
+			// the per-symbol mutable state — the window write pointer, the
+			// recent-distance LRU, and the last-low-offset run state — is
+			// pulled into local scalars so the hot literal/match paths skip
+			// the private-slot dispatch every iteration. all locals are
+			// spilled back to `this.#…` before each `break syncDecode`.
+			let write = this.#write;
+			let lastOffset = this.#lastOffset;
+			let lastLength = this.#lastLength;
+			let lastLowOffset = this.#lastLowOffset;
+			let lowOffsetRepeats = this.#lowOffsetRepeats;
+			let oldOff0 = this.#oldOffsets[0];
+			let oldOff1 = this.#oldOffsets[1];
+			let oldOff2 = this.#oldOffsets[2];
+			let oldOff3 = this.#oldOffsets[3];
+
 			syncDecode: for (;;) {
-				if (this.#write > targetWrite) {
+				if (write > targetWrite) {
+					this.#write = write;
 					throw new ChecksumMismatchError(`RAR3 wrote past expected size: ${unpackedSize} bytes`);
 				}
-				if (this.#write - emitted >= FLUSH_HIGH_WATER) {
+				if (write - emitted >= FLUSH_HIGH_WATER) {
 					break syncDecode;
 				}
 				if (inputExhausted) {
@@ -1668,7 +1685,7 @@ export class Rar3Decoder {
 				const symbol = decodeSymbol(mainTable, bits!);
 
 				if (symbol < 256) {
-					window[this.#write++ & mask] = symbol;
+					window[write++ & mask] = symbol;
 					continue;
 				}
 
@@ -1685,6 +1702,7 @@ export class Rar3Decoder {
 					// in-stream table change: re-parse codes against the same length
 					// table and keep decoding from the new tables. break out of the
 					// inner loop so the outer can refresh the table-local references.
+					this.#write = write;
 					const refreshed = parseCodes(bits!, this.#lengthTable, this.#codePool);
 					if (refreshed.kind !== 'huffman') {
 						throw new MalformedArchiveError(
@@ -1706,14 +1724,29 @@ export class Rar3Decoder {
 				let len: number;
 
 				if (symbol === 258) {
-					if (this.#lastLength === 0) {
+					if (lastLength === 0) {
 						continue;
 					}
-					offs = this.#lastOffset;
-					len = this.#lastLength;
+					offs = lastOffset;
+					len = lastLength;
 				} else if (symbol < 263) {
 					const offsetIndex = symbol - 259;
-					offs = this.#oldOffsets[offsetIndex];
+					if (offsetIndex === 0) {
+						offs = oldOff0;
+					} else if (offsetIndex === 1) {
+						offs = oldOff1;
+						oldOff1 = oldOff0;
+					} else if (offsetIndex === 2) {
+						offs = oldOff2;
+						oldOff2 = oldOff1;
+						oldOff1 = oldOff0;
+					} else {
+						offs = oldOff3;
+						oldOff3 = oldOff2;
+						oldOff2 = oldOff1;
+						oldOff1 = oldOff0;
+					}
+					oldOff0 = offs;
 					const lengthSymbol = decodeSymbol(lengthHuff, bits!);
 					if (lengthSymbol >= LENGTH_BASES.length) {
 						throw new MalformedArchiveError(`RAR3 length symbol out of range: ${lengthSymbol}`);
@@ -1722,10 +1755,6 @@ export class Rar3Decoder {
 					if (LENGTH_EXTRA_BITS[lengthSymbol] > 0) {
 						len += bits!.read(LENGTH_EXTRA_BITS[lengthSymbol]);
 					}
-					for (let i = offsetIndex; i > 0; i--) {
-						this.#oldOffsets[i] = this.#oldOffsets[i - 1];
-					}
-					this.#oldOffsets[0] = offs;
 				} else if (symbol < 271) {
 					const slot = symbol - 263;
 					offs = SHORT_BASES[slot] + 1;
@@ -1733,10 +1762,10 @@ export class Rar3Decoder {
 						offs += bits!.read(SHORT_EXTRA_BITS[slot]);
 					}
 					len = 2;
-					for (let i = 3; i > 0; i--) {
-						this.#oldOffsets[i] = this.#oldOffsets[i - 1];
-					}
-					this.#oldOffsets[0] = offs;
+					oldOff3 = oldOff2;
+					oldOff2 = oldOff1;
+					oldOff1 = oldOff0;
+					oldOff0 = offs;
 				} else {
 					const lengthSlot = symbol - 271;
 					if (lengthSlot >= LENGTH_BASES.length) {
@@ -1758,17 +1787,17 @@ export class Rar3Decoder {
 							if (extraBits > 4) {
 								offs += bits!.read(extraBits - 4) << 4;
 							}
-							if (this.#lowOffsetRepeats > 0) {
-								this.#lowOffsetRepeats--;
-								offs += this.#lastLowOffset;
+							if (lowOffsetRepeats > 0) {
+								lowOffsetRepeats--;
+								offs += lastLowOffset;
 							} else {
 								const lowSymbol = decodeSymbol(lowOffsetHuff, bits!);
 								if (lowSymbol === 16) {
-									this.#lowOffsetRepeats = 15;
-									offs += this.#lastLowOffset;
+									lowOffsetRepeats = 15;
+									offs += lastLowOffset;
 								} else {
 									offs += lowSymbol;
-									this.#lastLowOffset = lowSymbol;
+									lastLowOffset = lowSymbol;
 								}
 							}
 						} else {
@@ -1785,16 +1814,48 @@ export class Rar3Decoder {
 						len++;
 					}
 
-					for (let i = 3; i > 0; i--) {
-						this.#oldOffsets[i] = this.#oldOffsets[i - 1];
-					}
-					this.#oldOffsets[0] = offs;
+					oldOff3 = oldOff2;
+					oldOff2 = oldOff1;
+					oldOff1 = oldOff0;
+					oldOff0 = offs;
 				}
 
-				this.#lastOffset = offs;
-				this.#lastLength = len;
-				copy(len, offs);
+				lastOffset = offs;
+				lastLength = len;
+
+				// inline match copy: when source and destination ranges don't
+				// overlap (distance >= length) and neither end wraps the window,
+				// hand it to `copyWithin` (a single native memmove). overlap
+				// (distance < length) keeps the runlength repeat byte loop.
+				if (offs >= len) {
+					const dst = write & mask;
+					const src = (write - offs) & mask;
+					if (dst + len <= windowSize && src + len <= windowSize) {
+						window.copyWithin(dst, src, src + len);
+						write += len;
+						continue;
+					}
+				}
+				for (let idx = 0; idx < len; idx++) {
+					window[(write + idx) & mask] = window[(write + idx - offs) & mask];
+				}
+				write += len;
 			}
+
+			// spill the per-symbol locals back to the decoder's fields so the
+			// outer flush/refill/filter machinery (and any subsequent decode()
+			// call in the same solid run) sees consistent state. the literal
+			// path's overshoot check inside the loop already spills `write`
+			// before throwing.
+			this.#write = write;
+			this.#lastOffset = lastOffset;
+			this.#lastLength = lastLength;
+			this.#lastLowOffset = lastLowOffset;
+			this.#lowOffsetRepeats = lowOffsetRepeats;
+			this.#oldOffsets[0] = oldOff0;
+			this.#oldOffsets[1] = oldOff1;
+			this.#oldOffsets[2] = oldOff2;
+			this.#oldOffsets[3] = oldOff3;
 		}
 
 		await flush(true);
