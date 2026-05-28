@@ -1666,6 +1666,11 @@ export class Rar3Decoder {
 			let oldOff2 = this.#oldOffsets[2];
 			let oldOff3 = this.#oldOffsets[3];
 
+			// fold the slab cushion + tail-mode branch into one upper bound on
+			// `bits.addr`. `data` doesn't change inside the sync inner (only
+			// the outer's refill rebinds it), so the limit is loop-invariant.
+			const addrLimit = inputExhausted ? bits!.data.length - 5 : bits!.data.length - PAD - 16;
+
 			syncDecode: for (;;) {
 				if (write > targetWrite) {
 					this.#write = write;
@@ -1674,11 +1679,7 @@ export class Rar3Decoder {
 				if (write - emitted >= FLUSH_HIGH_WATER) {
 					break syncDecode;
 				}
-				if (inputExhausted) {
-					if (bits!.addr + 5 > bits!.data.length) {
-						break syncDecode;
-					}
-				} else if (bits!.addr + 16 > bits!.data.length - PAD) {
+				if (bits!.addr > addrLimit) {
 					break syncDecode;
 				}
 
