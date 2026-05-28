@@ -61,7 +61,7 @@ streaming RAR5 decoder written in TypeScript
 
 we use conventional commits with these rules:
 
-- a commit represents one logical work
+- a commit represents one logical change, split distinct changes into separate commits
 - accepted types: `feat`, `fix`, `refactor`, `docs`, `chore`
   - feat
     - new additions to public API surface
