@@ -10,15 +10,6 @@ import { crc32 } from '../lib/utils/crc32.ts';
  * via rarfile's `rar3_decompress` shell-out.
  */
 
-const fromHex = (hex: string): Uint8Array => {
-	const trimmed = hex.replaceAll(/\s+/g, '');
-	const out = new Uint8Array(trimmed.length / 2);
-	for (let i = 0; i < out.length; i++) {
-		out[i] = parseInt(trimmed.slice(i * 2, i * 2 + 2), 16);
-	}
-	return out;
-};
-
 const expectText = (
 	out: Uint8Array | undefined,
 	expected: string,
@@ -45,7 +36,7 @@ const expectText = (
 Deno.test('decodeOldLzss15: rarcomment fixture (16-byte archive comment)', () => {
 	// the v15 oldComment subblock data area from rar15-comment.rar's MAIN
 	// header: declen=16, expected text 'RARcomment -----', dataCrc=0xd0f2.
-	const data = fromHex('0f 92 e5 07 a3 f5 fe b4 8f 4a 0f 5d ed 15 e1 34 40 00');
+	const data = Uint8Array.fromHex('0f92e507a3f5feb48f4a0f5ded15e1344000');
 	expectText(decodeOldLzss15(data, 16), 'RARcomment -----', 0xd0f2, 'v15 corpus');
 });
 
@@ -59,7 +50,7 @@ Deno.test('decodeOldLzss15: empty input returns empty output', () => {
 Deno.test('decodeOldLzss20: rarcomment fixture (10-byte archive comment)', () => {
 	// the v20 oldComment subblock data area from rar202-comment-nopsw.rar's
 	// MAIN header: declen=10, expected text 'RARcomment', dataCrc=0x50ee.
-	const data = fromHex('10 00 4c 00 00 00 00 00 01 0a 6d a0 a8 2b 9f 07 95 fe 07 ab a3 81 ad a9 80');
+	const data = Uint8Array.fromHex('10004c0000000000010a6da0a82b9f0795fe07aba381ada980');
 	expectText(decodeOldLzss20(data, 10), 'RARcomment', 0x50ee, 'v20 corpus');
 });
 

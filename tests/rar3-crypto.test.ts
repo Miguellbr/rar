@@ -12,43 +12,27 @@ import { Sha1 } from '../lib/rar3/sha1.ts';
  * from rarfile's `tests/test_hashing.py::test_rar3_s2k`.
  */
 
-const fromHex = (hex: string): Uint8Array => {
-	const out = new Uint8Array(hex.length / 2);
-	for (let idx = 0; idx < out.length; idx++) {
-		out[idx] = parseInt(hex.slice(idx * 2, idx * 2 + 2), 16);
-	}
-	return out;
-};
-
-const toHex = (bytes: Uint8Array): string => {
-	let out = '';
-	for (const byte of bytes) {
-		out += byte.toString(16).padStart(2, '0');
-	}
-	return out;
-};
-
 const expectHex = (label: string, actual: Uint8Array, expected: string): void => {
-	const got = toHex(actual);
+	const got = actual.toHex();
 	if (got !== expected) {
 		throw new Error(`${label}: expected ${expected}, got ${got}`);
 	}
 };
 
 Deno.test('rar3DeriveKey: short password ("password" / 3-byte salt) matches rarfile', () => {
-	const { iv, key } = rar3DeriveKey('password', fromHex('00ff00'));
+	const { iv, key } = rar3DeriveKey('password', Uint8Array.fromHex('00ff00'));
 	expectHex('key', key, 'a160cb31cb262e9231c0b6fc984fbb0d');
 	expectHex('iv', iv, 'aa54a659fb0c359b30f353a6343fb11d');
 });
 
 Deno.test('rar3DeriveKey: 28-char password (64-byte seed, rarbug-threshold) matches rarfile', () => {
-	const { iv, key } = rar3DeriveKey('p'.repeat(28), fromHex('1122334455667788'));
+	const { iv, key } = rar3DeriveKey('p'.repeat(28), Uint8Array.fromHex('1122334455667788'));
 	expectHex('key', key, 'ffff33ffaf31987c899ccc2f965a8927');
 	expectHex('iv', iv, 'bdff6873721b247afa4f978448a5aeef');
 });
 
 Deno.test('rar3DeriveKey: 29-char password (66-byte seed, rarbug active) matches rarfile', () => {
-	const { iv, key } = rar3DeriveKey('p'.repeat(29), fromHex('1122334455667788'));
+	const { iv, key } = rar3DeriveKey('p'.repeat(29), Uint8Array.fromHex('1122334455667788'));
 	expectHex('key', key, '306cafde28f1ea78c9427c3ec642c0db');
 	expectHex('iv', iv, '173ecdf574c0bfe9e7c23bdfd96fa435');
 });
