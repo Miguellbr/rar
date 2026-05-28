@@ -22,6 +22,7 @@
 		"include": ["lib/", "LICENSE", "README.md", "deno.json"]
 	},
 	"imports": {
+		"@mary/crc32": "jsr:@mary/crc32@^0.1.0",
 		"@mary/ds-queue": "jsr:@mary/ds-queue@^0.1.3",
 		"@mary/mutex": "jsr:@mary/mutex@^0.1.0"
 	}

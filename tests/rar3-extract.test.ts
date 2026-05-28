@@ -1,7 +1,8 @@
+import { crc32 } from '@mary/crc32';
+
 import { MissingPasswordError, MissingVolumeError } from '../lib/errors.ts';
 import { fromUint8Array } from '../lib/reader/common.ts';
 import { unrar3 } from '../lib/rar3/extract.ts';
-import { crc32 } from '../lib/utils/crc32.ts';
 
 /**
  * @module

@@ -1,5 +1,6 @@
+import { crc32 } from '@mary/crc32';
+
 import { decodeOldLzss15, decodeOldLzss20 } from '../lib/rar3/oldlzss.ts';
-import { crc32 } from '../lib/utils/crc32.ts';
 
 /**
  * @module

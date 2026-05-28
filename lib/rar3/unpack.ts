@@ -12,8 +12,9 @@
  * of RARLAB's unrar.
  */
 
+import { crc32 } from '@mary/crc32';
+
 import { ChecksumMismatchError, MalformedArchiveError, UnsupportedFeatureError } from '../errors.ts';
-import { crc32 } from '../utils/crc32.ts';
 
 import type { StreamReader } from '../utils/stream-reader.ts';
 import { PPMD_CORRUPT, PPMD_END_OF_DATA, type PpmdByteIn, RAR3PpmdModel } from './ppmd.ts';

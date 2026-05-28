@@ -1,6 +1,7 @@
 {
   "version": "5",
   "specifiers": {
+    "jsr:@mary/crc32@0.1": "0.1.0",
     "jsr:@mary/ds-queue@~0.1.3": "0.1.3",
     "jsr:@mary/mutex@0.1": "0.1.0",
     "jsr:@std/assert@1": "1.0.19",
@@ -8,6 +9,9 @@
     "npm:@types/node@*": "24.1.0"
   },
   "jsr": {
+    "@mary/crc32@0.1.0": {
+      "integrity": "cadbfd1dc860a228b53dc180534f903eb0db9c0cc79eca109b9437791514a756"
+    },
     "@mary/ds-queue@0.1.3": {
       "integrity": "a743caa397b924cb08b0bbdffc526eb1ea2d3fc9e675da6edc137c437fc93c76"
     },
@@ -37,6 +41,7 @@
   },
   "workspace": {
     "dependencies": [
+      "jsr:@mary/crc32@0.1",
       "jsr:@mary/ds-queue@~0.1.3",
       "jsr:@mary/mutex@0.1"
     ]

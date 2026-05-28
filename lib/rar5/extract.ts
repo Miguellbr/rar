@@ -1,3 +1,5 @@
+import { crc32 } from '@mary/crc32';
+
 import {
 	ChecksumMismatchError,
 	InvalidSignatureError,
@@ -7,7 +9,6 @@ import {
 	UnsupportedFeatureError,
 } from '../errors.ts';
 import { concat, decodeUtf8From, read } from '../utils/buffer.ts';
-import { crc32 } from '../utils/crc32.ts';
 import {
 	crc32Verifier,
 	type DataSegment,

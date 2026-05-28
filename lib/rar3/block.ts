@@ -7,13 +7,14 @@
  * type-specific payload. data follows immediately after the header bytes.
  */
 
+import { crc32 } from '@mary/crc32';
+
 import {
 	ChecksumMismatchError,
 	InvalidSignatureError,
 	MalformedArchiveError,
 	TruncatedArchiveError,
 } from '../errors.ts';
-import { crc32 } from '../utils/crc32.ts';
 import { BlockFlag, BlockType, EndArcFlag, FileFlag, MainFlag, RAR3_SIGNATURE } from './constants.ts';
 
 // #region cursor

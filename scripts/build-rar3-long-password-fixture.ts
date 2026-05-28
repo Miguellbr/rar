@@ -11,10 +11,11 @@
  * run: `deno run -A scripts/build-rar3-long-password-fixture.ts`
  */
 
+import { crc32 } from '@mary/crc32';
+
 import { rar3DeriveKey } from '../lib/rar3/crypto.ts';
 import { importAesKey } from '../lib/rar5/crypto.ts';
 import { BlockFlag, BlockType, CompressMethod, FileFlag, HostOs } from '../lib/rar3/constants.ts';
-import { crc32 } from '../lib/utils/crc32.ts';
 
 const PASSWORD = 'the-rarbug-makes-this-key-funny!';
 const SALT = new Uint8Array([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);

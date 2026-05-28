@@ -1,6 +1,7 @@
+import { crc32 } from '@mary/crc32';
+
 import { ChecksumMismatchError, InvalidSignatureError } from '../errors.ts';
 import { textDecoder } from '../utils/buffer.ts';
-import { crc32 } from '../utils/crc32.ts';
 
 import {
 	BlockFlag,

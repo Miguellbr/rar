@@ -1,8 +1,9 @@
+import { crc32 } from '@mary/crc32';
+
 import { ChecksumMismatchError } from '../errors.ts';
 import type { Reader } from '../reader/types.ts';
 
 import { read } from './buffer.ts';
-import { crc32 } from './crc32.ts';
 
 /**
  * @module
