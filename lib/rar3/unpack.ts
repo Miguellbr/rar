@@ -332,9 +332,33 @@ interface HuffmanTable {
 	quickSym: Uint16Array;
 }
 
-// builds a canonical Huffman decode table from per-symbol code lengths.
-const createTable = (lengths: Uint8Array, size: number): HuffmanTable => {
-	const counts = new Uint32Array(MAX_SYMBOL_LENGTH + 1);
+// allocates an empty {@link HuffmanTable} sized for `symbolCount` symbols.
+// the metadata arrays (`decodeLen`, `decodePos`) and the quick lookup
+// (`quickLen`, `quickSym`) are fixed-size and shared across builds; only
+// `symbols` scales with the alphabet size.
+const allocTable = (symbolCount: number): HuffmanTable => ({
+	decodeLen: new Int32Array(MAX_SYMBOL_LENGTH + 1),
+	decodePos: new Uint32Array(MAX_SYMBOL_LENGTH + 1),
+	quickLen: new Uint8Array(QUICK_SIZE),
+	quickSym: new Uint16Array(QUICK_SIZE),
+	size: symbolCount,
+	symbols: new Uint16Array(symbolCount),
+});
+
+// populates `slot` with a canonical Huffman decode table built from
+// per-symbol code lengths. `slot.size` must match `size`. the caller
+// supplies reusable scratch buffers (`counts`, `cursor`) so a hot
+// decoder can build successive blocks without allocating either of them.
+const buildTableInto = (
+	slot: HuffmanTable,
+	lengths: Uint8Array,
+	size: number,
+	counts: Uint32Array,
+	cursor: Uint32Array,
+): void => {
+	const { decodeLen, decodePos, quickLen, quickSym, symbols } = slot;
+
+	counts.fill(0);
 	for (let idx = 0; idx < size; idx++) {
 		const len = lengths[idx];
 		if (len > MAX_SYMBOL_LENGTH) {
@@ -346,8 +370,8 @@ const createTable = (lengths: Uint8Array, size: number): HuffmanTable => {
 	}
 	counts[0] = 0;
 
-	const decodeLen = new Int32Array(MAX_SYMBOL_LENGTH + 1);
-	const decodePos = new Uint32Array(MAX_SYMBOL_LENGTH + 1);
+	decodeLen[0] = 0;
+	decodePos[0] = 0;
 
 	let upperLimit = 0;
 	for (let len = 1; len <= MAX_SYMBOL_LENGTH; len++) {
@@ -360,19 +384,19 @@ const createTable = (lengths: Uint8Array, size: number): HuffmanTable => {
 		throw new MalformedArchiveError('over-subscribed RAR3 Huffman table');
 	}
 
-	const symbols = new Uint16Array(size);
-	{
-		const cursor = decodePos.slice();
-		for (let idx = 0; idx < size; idx++) {
-			const len = lengths[idx];
-			if (len > 0) {
-				symbols[cursor[len]++] = idx;
-			}
+	// symbols slots not reached by the cursor loop must read back as 0 (the
+	// `position >= size ? 0 : position` fallback in decodeSymbol and the
+	// `quickSym[code] = 0` branch below assume an out-of-range index lands on
+	// a zero entry); clear before populating.
+	symbols.fill(0);
+	cursor.set(decodePos);
+	for (let idx = 0; idx < size; idx++) {
+		const len = lengths[idx];
+		if (len > 0) {
+			symbols[cursor[len]++] = idx;
 		}
 	}
 
-	const quickLen = new Uint8Array(QUICK_SIZE);
-	const quickSym = new Uint16Array(QUICK_SIZE);
 	let len = 1;
 	for (let code = 0; code < QUICK_SIZE; code++) {
 		const field = code << (16 - QUICK_BITS);
@@ -388,8 +412,6 @@ const createTable = (lengths: Uint8Array, size: number): HuffmanTable => {
 		const position = decodePos[len] + ((field - decodeLen[len - 1]) >>> (16 - len));
 		quickSym[code] = position < size ? symbols[position] : 0;
 	}
-
-	return { decodeLen, decodePos, quickLen, quickSym, size, symbols };
 };
 
 // decodes one symbol from the bit stream using a decode table.
@@ -441,14 +463,50 @@ type CodeMode =
 		escape: number;
 	};
 
-// reads the four Huffman tables that drive the LZSS engine. `lengthtable`
-// carries the per-symbol bit lengths across calls because RAR3 supports a
-// "keep existing tables" mode: a 1 bit means amend the running table by the
-// (signed-4-bit-delta-style) precode output; a 0 bit means start fresh from
-// all zeros.
+// scratch + slot pool used by {@link Rar3Decoder} when parsing a code block.
+// the four LZSS tables (main / offset / lowOffset / length) and the
+// short-lived precode table each occupy a fixed slot; `buildTableInto`
+// populates them in place so a block-heavy archive never reallocates the
+// per-table arrays.
+interface CodePool {
+	readonly counts: Uint32Array;
+	readonly cursor: Uint32Array;
+	readonly precodeLengths: Uint8Array;
+	readonly precode: HuffmanTable;
+	readonly main: HuffmanTable;
+	readonly offset: HuffmanTable;
+	readonly lowOffset: HuffmanTable;
+	readonly length: HuffmanTable;
+	readonly tables: Tables;
+}
+
+const allocCodePool = (): CodePool => {
+	const main = allocTable(MAIN_CODE_SIZE);
+	const offset = allocTable(OFFSET_CODE_SIZE);
+	const lowOffset = allocTable(LOW_OFFSET_CODE_SIZE);
+	const length = allocTable(LENGTH_CODE_SIZE);
+	return {
+		counts: new Uint32Array(MAX_SYMBOL_LENGTH + 1),
+		cursor: new Uint32Array(MAX_SYMBOL_LENGTH + 1),
+		length,
+		lowOffset,
+		main,
+		offset,
+		precode: allocTable(PRECODE_SIZE),
+		precodeLengths: new Uint8Array(PRECODE_SIZE),
+		tables: { length, lowOffset, main, offset },
+	};
+};
+
+// reads the four Huffman tables that drive the LZSS engine, populating the
+// caller's pool slots in place. `lengthTable` carries the per-symbol bit
+// lengths across calls because RAR3 supports a "keep existing tables" mode:
+// a 1 bit means amend the running table by the (signed-4-bit-delta-style)
+// precode output; a 0 bit means start fresh from all zeros.
 const parseCodes = (
 	bits: BitReader,
 	lengthTable: Uint8Array,
+	pool: CodePool,
 ): CodeMode => {
 	bits.alignByte();
 
@@ -488,7 +546,7 @@ const parseCodes = (
 	// stage 1: 20 nibble-packed precode lengths with a 0xF escape used both
 	// for the literal length 15 (when the next nibble is 0) and for a run of
 	// zero lengths (when the next nibble is non-zero).
-	const precodeLengths = new Uint8Array(PRECODE_SIZE);
+	const precodeLengths = pool.precodeLengths;
 	for (let idx = 0; idx < PRECODE_SIZE;) {
 		const value = bits.read(4);
 		if (value !== 0xf) {
@@ -504,14 +562,14 @@ const parseCodes = (
 			}
 		}
 	}
-	const precode = createTable(precodeLengths, PRECODE_SIZE);
+	buildTableInto(pool.precode, precodeLengths, PRECODE_SIZE, pool.counts, pool.cursor);
 
 	// stage 2: walk the precode, applying its symbols to `lengthTable`.
 	// symbols 0-15 add to the running length (mod 16); 16/17 repeat the
 	// previous length for 3 + 3-bit (16) or 11 + 7-bit (17) entries; 18/19
 	// emit a run of zero lengths with the same two run-length encodings.
 	for (let idx = 0; idx < HUFFMAN_TABLE_SIZE;) {
-		const symbol = decodeSymbol(precode, bits);
+		const symbol = decodeSymbol(pool.precode, bits);
 
 		if (symbol < 16) {
 			lengthTable[idx] = (lengthTable[idx] + symbol) & 0xf;
@@ -533,24 +591,39 @@ const parseCodes = (
 		}
 	}
 
-	const main = createTable(lengthTable.subarray(0, MAIN_CODE_SIZE), MAIN_CODE_SIZE);
-	const offset = createTable(
+	buildTableInto(
+		pool.main,
+		lengthTable.subarray(0, MAIN_CODE_SIZE),
+		MAIN_CODE_SIZE,
+		pool.counts,
+		pool.cursor,
+	);
+	buildTableInto(
+		pool.offset,
 		lengthTable.subarray(MAIN_CODE_SIZE, MAIN_CODE_SIZE + OFFSET_CODE_SIZE),
 		OFFSET_CODE_SIZE,
+		pool.counts,
+		pool.cursor,
 	);
-	const lowOffset = createTable(
+	buildTableInto(
+		pool.lowOffset,
 		lengthTable.subarray(
 			MAIN_CODE_SIZE + OFFSET_CODE_SIZE,
 			MAIN_CODE_SIZE + OFFSET_CODE_SIZE + LOW_OFFSET_CODE_SIZE,
 		),
 		LOW_OFFSET_CODE_SIZE,
+		pool.counts,
+		pool.cursor,
 	);
-	const length = createTable(
+	buildTableInto(
+		pool.length,
 		lengthTable.subarray(MAIN_CODE_SIZE + OFFSET_CODE_SIZE + LOW_OFFSET_CODE_SIZE),
 		LENGTH_CODE_SIZE,
+		pool.counts,
+		pool.cursor,
 	);
 
-	return { kind: 'huffman', tables: { length, lowOffset, main, offset } };
+	return { kind: 'huffman', tables: pool.tables };
 };
 
 // #endregion
@@ -1031,6 +1104,12 @@ export class Rar3Decoder {
 
 	/** running bit lengths used by `keep-existing-tables` (precode) mode. */
 	readonly #lengthTable = new Uint8Array(HUFFMAN_TABLE_SIZE);
+	/**
+	 * pooled Huffman scratch + table slots populated in place by {@link parseCodes}.
+	 * sharing them across blocks keeps every code-block transition off the
+	 * allocator and out of the GC's path.
+	 */
+	readonly #codePool = allocCodePool();
 	#tables?: Tables;
 	/** set when the previous entry left a `start new table` marker in flight. */
 	#startNewTable = true;
@@ -1429,7 +1508,7 @@ export class Rar3Decoder {
 			}
 
 			if (this.#startNewTable) {
-				const mode = parseCodes(bits!, this.#lengthTable);
+				const mode = parseCodes(bits!, this.#lengthTable, this.#codePool);
 				if (mode.kind === 'huffman') {
 					this.#tables = mode.tables;
 					this.#ppmd = undefined;
@@ -1606,7 +1685,7 @@ export class Rar3Decoder {
 					// in-stream table change: re-parse codes against the same length
 					// table and keep decoding from the new tables. break out of the
 					// inner loop so the outer can refresh the table-local references.
-					const refreshed = parseCodes(bits!, this.#lengthTable);
+					const refreshed = parseCodes(bits!, this.#lengthTable, this.#codePool);
 					if (refreshed.kind !== 'huffman') {
 						throw new MalformedArchiveError(
 							'RAR3 in-stream table refresh switched to PPMd unexpectedly',
