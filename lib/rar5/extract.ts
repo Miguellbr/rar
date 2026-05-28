@@ -230,14 +230,12 @@ async function* walkVolumes(
 /**
  * walks every parsed block of a RAR5 archive (or multi-volume set), yielding
  * each block paired with the reader it came from. encrypted block headers are
- * decrypted on the fly when a password is supplied; for an archive whose
- * headers are not encrypted no password is needed.
+ * decrypted on the fly when `options.password` is supplied.
  *
  * @param source one reader for a single-volume archive, or the ordered set of
  * volume readers for a multi-volume archive
  * @param options optional settings such as the password for encrypted headers
- * @returns async generator yielding every block, with `block.dataOffset`
- * corrected for the on-disk header frame size
+ * @returns async generator yielding every block tagged with its volume reader
  */
 export async function* walkRar5Archive(
 	source: Reader | readonly Reader[],
@@ -251,13 +249,8 @@ export async function* walkRar5Archive(
 /**
  * a single file entry within a RAR5 archive.
  *
- * metadata is available immediately; the entry's content is read lazily from
- * the archive when {@link Rar5Entry.body} or one of the convenience readers is
- * consumed. an entry that belongs to a solid run shares its decompression
- * state with the entries preceding it, and an entry whose data is split
- * across volumes spans multiple readers internally; the {@link unrar5}
- * iterator drives both kinds of coordination so callers can simply consume
- * entries in order.
+ * metadata is available immediately; the entry's content is read lazily when
+ * {@link Rar5Entry.body} or one of the convenience readers is consumed.
  */
 export class Rar5Entry {
 	readonly #head: FileBlock;
@@ -656,15 +649,9 @@ export class Rar5Entry {
 /**
  * extracts entries from a RAR5 archive.
  *
- * the archive is read through `source`, which is either a single {@link Reader}
- * for a self-contained archive or an ordered list of readers for the volumes
- * of a multi-volume set. entries are yielded in archive order as their headers
- * are walked; a file whose data spans volumes is yielded once after its final
- * segment is seen. superseded file versions are omitted.
- *
- * entries that belong to a solid run share a single decompression window; the
- * iterator ensures the previous entry's body is materialized before yielding
- * the next solid entry, so consumers can treat them like any other entry.
+ * entries are yielded in archive order; split entries are yielded once after
+ * their final segment, superseded versions are omitted, and solid runs are
+ * decoded transparently.
  *
  * @param source one reader for a single-volume archive, or the ordered set of
  * volume readers for a multi-volume archive

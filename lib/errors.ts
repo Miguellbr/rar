@@ -14,10 +14,7 @@ export class UnrarError extends Error {
 	override name: string = 'UnrarError';
 }
 
-/**
- * an extracted entry's data did not match the checksum or size recorded in
- * the archive. covers header CRC, file CRC32, and split-data length checks.
- */
+/** stored data did not match a checksum or size recorded in the archive. */
 export class ChecksumMismatchError extends UnrarError {
 	override name: string = 'ChecksumMismatchError';
 }
@@ -35,11 +32,7 @@ export class InvalidSignatureError extends UnrarError {
 	override name: string = 'InvalidSignatureError';
 }
 
-/**
- * the archive's structure is corrupt or violates the format spec: a header
- * field is out of range, a vint runs past its buffer, a huffman table is
- * over-subscribed, etc. there is nothing the caller can recover by retrying.
- */
+/** the archive's structure is corrupt or violates the format spec; no retry will help. */
 export class MalformedArchiveError extends UnrarError {
 	override name: string = 'MalformedArchiveError';
 }
@@ -61,9 +54,7 @@ export class MissingVolumeError extends UnrarError {
 }
 
 /**
- * the underlying {@link Reader} failed to deliver bytes — an HTTP fetch
- * returned a non-2xx status, a content-length header was missing, a server
- * did not honour a range request, and so on. distinct from
+ * the underlying {@link Reader} failed to deliver bytes. distinct from
  * {@link TruncatedArchiveError}, which fires when the reader succeeds but
  * the archive itself ends mid-structure.
  */
@@ -71,21 +62,12 @@ export class ReaderError extends UnrarError {
 	override name: string = 'ReaderError';
 }
 
-/**
- * the archive ends in the middle of a structure: a block header declares
- * more bytes than the source contains, a stream runs out before the
- * expected number of bytes is delivered, or the source is shorter than the
- * signature.
- */
+/** the archive ends in the middle of a structure. */
 export class TruncatedArchiveError extends UnrarError {
 	override name: string = 'TruncatedArchiveError';
 }
 
-/**
- * the archive uses a feature this library does not implement yet — an
- * encryption algorithm other than 0, an RAR3 audio/RGB filter, a PPMd
- * filter command, and so on.
- */
+/** the archive uses a feature this library does not implement yet. */
 export class UnsupportedFeatureError extends UnrarError {
 	override name: string = 'UnsupportedFeatureError';
 }

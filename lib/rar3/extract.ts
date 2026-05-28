@@ -136,11 +136,7 @@ async function* walkVolumes(readers: readonly Reader[]): AsyncGenerator<Rar3Volu
  * a single file entry within a RAR3 archive.
  *
  * metadata is available immediately; the entry's content is read lazily when
- * {@link Rar3Entry.body} or one of the convenience readers is consumed. an
- * entry whose data is split across volumes spans multiple readers internally.
- *
- * stored and LZSS-compressed entries (including password-protected ones,
- * when the caller passes `password` to {@link unrar3}) extract end to end;
+ * {@link Rar3Entry.body} or one of the convenience readers is consumed.
  * PPMd-compressed entries throw at read time pending the PPMd decoder.
  */
 export class Rar3Entry {
@@ -478,11 +474,8 @@ const prepareReaders = async (
 /**
  * walks every parsed block of a RAR3 archive (or multi-volume set), yielding
  * each block paired with the reader it came from. only header bytes are read;
- * data areas are skipped, so a listing pass never invokes the decoder.
- *
- * volumes whose main header is marked password-protected (hpsw) are slurped
- * into memory and header-decrypted before walking; unencrypted volumes pass
- * through with no extra allocation.
+ * data areas are skipped. encrypted-header volumes are decrypted on the fly
+ * when `options.password` is supplied.
  *
  * @param source one reader for a single-volume archive, or the ordered set of
  * volume readers for a multi-volume archive
@@ -503,16 +496,9 @@ export async function* walkRar3Archive(
 /**
  * extracts entries from a RAR3 (RAR1.5 - RAR4) archive.
  *
- * the archive is read through `source`, which is either a single {@link Reader}
- * for a self-contained archive or an ordered list of readers for the volumes
- * of a multi-volume set. entries are yielded in archive order; a file whose
- * data spans volumes is yielded once after its final segment is seen.
- * superseded file versions are omitted.
- *
- * compressed entries flow through the LZSS decoder; PPMd blocks and the VM
- * filter symbol throw at read time, pending implementations of each.
- * password-protected entries decrypt on read when `options.password` is
- * supplied.
+ * entries are yielded in archive order; split entries are yielded once after
+ * their final segment, and superseded versions are omitted. PPMd blocks and
+ * custom VM filter programs throw at read time pending implementations.
  *
  * @param source one reader for a single-volume archive, or the ordered set of
  * volume readers for a multi-volume archive
