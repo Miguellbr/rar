@@ -439,6 +439,24 @@ const decodeSymbol = (table: HuffmanTable, bits: BitReader): number => {
 	return table.symbols[position >= table.size ? 0 : position];
 };
 
+// slow-path Huffman resolution for a code longer than `QUICK_BITS` (the quick
+// table missed). split out of the inlined accumulator decode in
+// {@link runLzssBlock} so its hot quick path stays tiny; this rare branch
+// returns the symbol and its bit length packed as `(symbol << 4) | length`
+// (length is 11..15, so it fits the low nibble) to dodge a multi-value return.
+const decodeSlow = (table: HuffmanTable, field: number): number => {
+	let length = MAX_SYMBOL_LENGTH;
+	for (let candidate = QUICK_BITS + 1; candidate < MAX_SYMBOL_LENGTH; candidate++) {
+		if (field < table.decodeLen[candidate]) {
+			length = candidate;
+			break;
+		}
+	}
+	const position = table.decodePos[length] +
+		((field - table.decodeLen[length - 1]) >>> (16 - length));
+	return (table.symbols[position >= table.size ? 0 : position] << 4) | length;
+};
+
 // #endregion
 
 // #region table parsing
@@ -1090,13 +1108,16 @@ interface LzssState {
 
 // runs the synchronous RAR3 LZSS symbol loop until it must yield back to the
 // async driver. extracted from {@link Rar3Decoder.decode} as a standalone
-// function precisely so it stays small enough for the JIT to optimise hot and
-// inline {@link decodeSymbol} (and its `peek16`/`skip`) — the 600-line async
-// method it used to live in is far past V8's inlining budget.
+// function so the JIT optimises it as one hot unit: the Huffman decode and
+// every bit read are inlined here against a register-resident bit accumulator
+// rather than dispatched through `BitReader.peek16`/`skip` per symbol (the
+// `decodeSlow` helper is the only out-of-line branch, for codes past
+// `QUICK_BITS`). the 600-line async method it used to live in was far past
+// V8's inlining budget, so those calls stayed cold there.
 //
 // `state` carries the per-symbol scalars in and out; `window`/`mask`/
 // `windowSize` are the circular dictionary; `addrLimit` folds the slab cushion
-// and tail-mode bound into one loop-invariant ceiling on `bits.addr`.
+// and tail-mode bound into one loop-invariant ceiling on the consumed byte.
 //
 // @returns one of the `LZSS_*` stop reasons
 const runLzssBlock = (
@@ -1126,6 +1147,24 @@ const runLzssBlock = (
 	let oldOff2 = state.oldOff2;
 	let oldOff3 = state.oldOff3;
 
+	// local MSB-first bit accumulator. `acc` holds the next `bitsInAcc`
+	// unconsumed bits in its low end; `addr` is the read-ahead byte cursor into
+	// the (PAD-padded) buffer. seeding from `bits.addr`/`bits.bit` and
+	// collapsing back on every exit keeps this entirely private to one call —
+	// `parseCodes`, PPMd, filters and `ensureBytes` still see canonical
+	// addr/bit. this replaces the per-symbol `peek16` (3 array loads + realign)
+	// and `skip` method calls with register-resident locals the JIT keeps hot.
+	const data = bits.data;
+	const dataLen = data.length;
+	let addr = bits.addr;
+	let acc = 0;
+	let bitsInAcc = 0;
+	if (bits.bit !== 0) {
+		acc = data[addr] & (0xff >>> bits.bit);
+		bitsInAcc = 8 - bits.bit;
+		addr++;
+	}
+
 	let stop: number;
 	syncDecode: for (;;) {
 		if (write > targetWrite) {
@@ -1136,12 +1175,32 @@ const runLzssBlock = (
 			stop = LZSS_FLUSH;
 			break syncDecode;
 		}
-		if (bits.addr > addrLimit) {
+		// the consumed byte position equals what we would collapse `addr`/`acc`
+		// back to; gate on it exactly as the old loop gated on `bits.addr`.
+		if ((((addr << 3) - bitsInAcc) >> 3) > addrLimit) {
 			stop = LZSS_REFILL;
 			break syncDecode;
 		}
 
-		const symbol = decodeSymbol(mainTable, bits);
+		// --- decode main symbol (inlined accumulator + quick table) ---
+		while (bitsInAcc < 16) {
+			acc = (acc << 8) | (addr < dataLen ? data[addr] : 0);
+			addr++;
+			bitsInAcc += 8;
+		}
+		let symbol: number;
+		{
+			const field = (acc >>> (bitsInAcc - 16)) & 0xffff;
+			if (field < mainTable.decodeLen[QUICK_BITS]) {
+				const code = field >>> (16 - QUICK_BITS);
+				bitsInAcc -= mainTable.quickLen[code];
+				symbol = mainTable.quickSym[code];
+			} else {
+				const packed = decodeSlow(mainTable, field);
+				symbol = packed >>> 4;
+				bitsInAcc -= packed & 15;
+			}
+		}
 
 		if (symbol < 256) {
 			window[write++ & mask] = symbol;
@@ -1149,9 +1208,16 @@ const runLzssBlock = (
 		}
 
 		if (symbol === 256) {
-			const newFile = bits.read(1) === 0;
+			while (bitsInAcc < 2) {
+				acc = (acc << 8) | (addr < dataLen ? data[addr] : 0);
+				addr++;
+				bitsInAcc += 8;
+			}
+			const newFile = ((acc >>> (bitsInAcc - 1)) & 1) === 0;
+			bitsInAcc -= 1;
 			if (newFile) {
-				state.endNewTable = bits.read(1) !== 0;
+				state.endNewTable = ((acc >>> (bitsInAcc - 1)) & 1) !== 0;
+				bitsInAcc -= 1;
 				stop = LZSS_END;
 				break syncDecode;
 			}
@@ -1193,19 +1259,51 @@ const runLzssBlock = (
 				oldOff1 = oldOff0;
 			}
 			oldOff0 = offs;
-			const lengthSymbol = decodeSymbol(lengthHuff, bits);
+			// --- decode length symbol ---
+			while (bitsInAcc < 16) {
+				acc = (acc << 8) | (addr < dataLen ? data[addr] : 0);
+				addr++;
+				bitsInAcc += 8;
+			}
+			let lengthSymbol: number;
+			{
+				const field = (acc >>> (bitsInAcc - 16)) & 0xffff;
+				if (field < lengthHuff.decodeLen[QUICK_BITS]) {
+					const code = field >>> (16 - QUICK_BITS);
+					bitsInAcc -= lengthHuff.quickLen[code];
+					lengthSymbol = lengthHuff.quickSym[code];
+				} else {
+					const packed = decodeSlow(lengthHuff, field);
+					lengthSymbol = packed >>> 4;
+					bitsInAcc -= packed & 15;
+				}
+			}
 			if (lengthSymbol >= LENGTH_BASES.length) {
 				throw new MalformedArchiveError(`RAR3 length symbol out of range: ${lengthSymbol}`);
 			}
 			len = LENGTH_BASES[lengthSymbol] + 2;
-			if (LENGTH_EXTRA_BITS[lengthSymbol] > 0) {
-				len += bits.read(LENGTH_EXTRA_BITS[lengthSymbol]);
+			const extra = LENGTH_EXTRA_BITS[lengthSymbol];
+			if (extra > 0) {
+				while (bitsInAcc < extra) {
+					acc = (acc << 8) | (addr < dataLen ? data[addr] : 0);
+					addr++;
+					bitsInAcc += 8;
+				}
+				bitsInAcc -= extra;
+				len += (acc >>> bitsInAcc) & ((1 << extra) - 1);
 			}
 		} else if (symbol < 271) {
 			const slot = symbol - 263;
 			offs = SHORT_BASES[slot] + 1;
-			if (SHORT_EXTRA_BITS[slot] > 0) {
-				offs += bits.read(SHORT_EXTRA_BITS[slot]);
+			const extra = SHORT_EXTRA_BITS[slot];
+			if (extra > 0) {
+				while (bitsInAcc < extra) {
+					acc = (acc << 8) | (addr < dataLen ? data[addr] : 0);
+					addr++;
+					bitsInAcc += 8;
+				}
+				bitsInAcc -= extra;
+				offs += (acc >>> bitsInAcc) & ((1 << extra) - 1);
 			}
 			len = 2;
 			oldOff3 = oldOff2;
@@ -1218,11 +1316,36 @@ const runLzssBlock = (
 				throw new MalformedArchiveError(`RAR3 main symbol out of length range: ${symbol}`);
 			}
 			len = LENGTH_BASES[lengthSlot] + 3;
-			if (LENGTH_EXTRA_BITS[lengthSlot] > 0) {
-				len += bits.read(LENGTH_EXTRA_BITS[lengthSlot]);
+			const lenExtra = LENGTH_EXTRA_BITS[lengthSlot];
+			if (lenExtra > 0) {
+				while (bitsInAcc < lenExtra) {
+					acc = (acc << 8) | (addr < dataLen ? data[addr] : 0);
+					addr++;
+					bitsInAcc += 8;
+				}
+				bitsInAcc -= lenExtra;
+				len += (acc >>> bitsInAcc) & ((1 << lenExtra) - 1);
 			}
 
-			const offsetSymbol = decodeSymbol(offsetHuff, bits);
+			// --- decode offset symbol ---
+			while (bitsInAcc < 16) {
+				acc = (acc << 8) | (addr < dataLen ? data[addr] : 0);
+				addr++;
+				bitsInAcc += 8;
+			}
+			let offsetSymbol: number;
+			{
+				const field = (acc >>> (bitsInAcc - 16)) & 0xffff;
+				if (field < offsetHuff.decodeLen[QUICK_BITS]) {
+					const code = field >>> (16 - QUICK_BITS);
+					bitsInAcc -= offsetHuff.quickLen[code];
+					offsetSymbol = offsetHuff.quickSym[code];
+				} else {
+					const packed = decodeSlow(offsetHuff, field);
+					offsetSymbol = packed >>> 4;
+					bitsInAcc -= packed & 15;
+				}
+			}
 			if (offsetSymbol >= OFFSET_BASES.length) {
 				throw new MalformedArchiveError(`RAR3 offset symbol out of range: ${offsetSymbol}`);
 			}
@@ -1231,13 +1354,38 @@ const runLzssBlock = (
 			if (extraBits > 0) {
 				if (offsetSymbol > 9) {
 					if (extraBits > 4) {
-						offs += bits.read(extraBits - 4) << 4;
+						const high = extraBits - 4;
+						while (bitsInAcc < high) {
+							acc = (acc << 8) | (addr < dataLen ? data[addr] : 0);
+							addr++;
+							bitsInAcc += 8;
+						}
+						bitsInAcc -= high;
+						offs += ((acc >>> bitsInAcc) & ((1 << high) - 1)) << 4;
 					}
 					if (lowOffsetRepeats > 0) {
 						lowOffsetRepeats--;
 						offs += lastLowOffset;
 					} else {
-						const lowSymbol = decodeSymbol(lowOffsetHuff, bits);
+						// --- decode low-offset symbol ---
+						while (bitsInAcc < 16) {
+							acc = (acc << 8) | (addr < dataLen ? data[addr] : 0);
+							addr++;
+							bitsInAcc += 8;
+						}
+						let lowSymbol: number;
+						{
+							const field = (acc >>> (bitsInAcc - 16)) & 0xffff;
+							if (field < lowOffsetHuff.decodeLen[QUICK_BITS]) {
+								const code = field >>> (16 - QUICK_BITS);
+								bitsInAcc -= lowOffsetHuff.quickLen[code];
+								lowSymbol = lowOffsetHuff.quickSym[code];
+							} else {
+								const packed = decodeSlow(lowOffsetHuff, field);
+								lowSymbol = packed >>> 4;
+								bitsInAcc -= packed & 15;
+							}
+						}
 						if (lowSymbol === 16) {
 							lowOffsetRepeats = 15;
 							offs += lastLowOffset;
@@ -1247,7 +1395,13 @@ const runLzssBlock = (
 						}
 					}
 				} else {
-					offs += bits.read(extraBits);
+					while (bitsInAcc < extraBits) {
+						acc = (acc << 8) | (addr < dataLen ? data[addr] : 0);
+						addr++;
+						bitsInAcc += 8;
+					}
+					bitsInAcc -= extraBits;
+					offs += (acc >>> bitsInAcc) & ((1 << extraBits) - 1);
 				}
 			}
 
@@ -1287,6 +1441,13 @@ const runLzssBlock = (
 		}
 		write += len;
 	}
+
+	// collapse the read-ahead accumulator back to the canonical bit position:
+	// the consumed bit count is `addr * 8 - bitsInAcc` (the surplus bits in
+	// `acc` were peeked, not consumed). everything downstream reads addr/bit.
+	const consumed = (addr << 3) - bitsInAcc;
+	bits.addr = consumed >> 3;
+	bits.bit = consumed & 7;
 
 	state.write = write;
 	state.lastOffset = lastOffset;
