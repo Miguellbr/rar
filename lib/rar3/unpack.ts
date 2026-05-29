@@ -1059,6 +1059,249 @@ const runFilter = (filter: PendingFilter, source: Uint8Array, entryPos: number):
 
 // #endregion
 
+// #region lzss inner loop
+
+// why {@link runLzssBlock} stopped, so the async driver can decide what to do
+// next: top up the bit reader, flush settled bytes, finish the entry, refresh
+// the in-stream Huffman tables, or hand off a filter command.
+const LZSS_REFILL = 0;
+const LZSS_FLUSH = 1;
+const LZSS_END = 2;
+const LZSS_REFRESH = 3;
+const LZSS_FILTER = 4;
+
+// the per-symbol mutable LZSS state, lifted out of {@link Rar3Decoder} so the
+// hot inner loop can carry it in plain locals (the win the field layout can't
+// give: a private-slot load per symbol). the driver copies its fields in
+// before each call and reads them back after.
+interface LzssState {
+	write: number;
+	lastOffset: number;
+	lastLength: number;
+	lastLowOffset: number;
+	lowOffsetRepeats: number;
+	oldOff0: number;
+	oldOff1: number;
+	oldOff2: number;
+	oldOff3: number;
+	/** on {@link LZSS_END}: whether the next entry should rebuild its tables. */
+	endNewTable: boolean;
+}
+
+// runs the synchronous RAR3 LZSS symbol loop until it must yield back to the
+// async driver. extracted from {@link Rar3Decoder.decode} as a standalone
+// function precisely so it stays small enough for the JIT to optimise hot and
+// inline {@link decodeSymbol} (and its `peek16`/`skip`) — the 600-line async
+// method it used to live in is far past V8's inlining budget.
+//
+// `state` carries the per-symbol scalars in and out; `window`/`mask`/
+// `windowSize` are the circular dictionary; `addrLimit` folds the slab cushion
+// and tail-mode bound into one loop-invariant ceiling on `bits.addr`.
+//
+// @returns one of the `LZSS_*` stop reasons
+const runLzssBlock = (
+	bits: BitReader,
+	tables: Tables,
+	window: Uint8Array,
+	mask: number,
+	windowSize: number,
+	state: LzssState,
+	emitted: number,
+	targetWrite: number,
+	flushHighWater: number,
+	addrLimit: number,
+): number => {
+	const mainTable = tables.main;
+	const lengthHuff = tables.length;
+	const offsetHuff = tables.offset;
+	const lowOffsetHuff = tables.lowOffset;
+
+	let write = state.write;
+	let lastOffset = state.lastOffset;
+	let lastLength = state.lastLength;
+	let lastLowOffset = state.lastLowOffset;
+	let lowOffsetRepeats = state.lowOffsetRepeats;
+	let oldOff0 = state.oldOff0;
+	let oldOff1 = state.oldOff1;
+	let oldOff2 = state.oldOff2;
+	let oldOff3 = state.oldOff3;
+
+	let stop: number;
+	syncDecode: for (;;) {
+		if (write > targetWrite) {
+			state.write = write;
+			throw new ChecksumMismatchError(`RAR3 wrote past expected size`);
+		}
+		if (write - emitted >= flushHighWater) {
+			stop = LZSS_FLUSH;
+			break syncDecode;
+		}
+		if (bits.addr > addrLimit) {
+			stop = LZSS_REFILL;
+			break syncDecode;
+		}
+
+		const symbol = decodeSymbol(mainTable, bits);
+
+		if (symbol < 256) {
+			window[write++ & mask] = symbol;
+			continue;
+		}
+
+		if (symbol === 256) {
+			const newFile = bits.read(1) === 0;
+			if (newFile) {
+				state.endNewTable = bits.read(1) !== 0;
+				stop = LZSS_END;
+				break syncDecode;
+			}
+			// in-stream table change: the driver re-parses codes and re-enters.
+			stop = LZSS_REFRESH;
+			break syncDecode;
+		}
+
+		if (symbol === 257) {
+			// filter command bodies can span ~65 KiB and need async refills.
+			stop = LZSS_FILTER;
+			break syncDecode;
+		}
+
+		let offs: number;
+		let len: number;
+
+		if (symbol === 258) {
+			if (lastLength === 0) {
+				continue;
+			}
+			offs = lastOffset;
+			len = lastLength;
+		} else if (symbol < 263) {
+			const offsetIndex = symbol - 259;
+			if (offsetIndex === 0) {
+				offs = oldOff0;
+			} else if (offsetIndex === 1) {
+				offs = oldOff1;
+				oldOff1 = oldOff0;
+			} else if (offsetIndex === 2) {
+				offs = oldOff2;
+				oldOff2 = oldOff1;
+				oldOff1 = oldOff0;
+			} else {
+				offs = oldOff3;
+				oldOff3 = oldOff2;
+				oldOff2 = oldOff1;
+				oldOff1 = oldOff0;
+			}
+			oldOff0 = offs;
+			const lengthSymbol = decodeSymbol(lengthHuff, bits);
+			if (lengthSymbol >= LENGTH_BASES.length) {
+				throw new MalformedArchiveError(`RAR3 length symbol out of range: ${lengthSymbol}`);
+			}
+			len = LENGTH_BASES[lengthSymbol] + 2;
+			if (LENGTH_EXTRA_BITS[lengthSymbol] > 0) {
+				len += bits.read(LENGTH_EXTRA_BITS[lengthSymbol]);
+			}
+		} else if (symbol < 271) {
+			const slot = symbol - 263;
+			offs = SHORT_BASES[slot] + 1;
+			if (SHORT_EXTRA_BITS[slot] > 0) {
+				offs += bits.read(SHORT_EXTRA_BITS[slot]);
+			}
+			len = 2;
+			oldOff3 = oldOff2;
+			oldOff2 = oldOff1;
+			oldOff1 = oldOff0;
+			oldOff0 = offs;
+		} else {
+			const lengthSlot = symbol - 271;
+			if (lengthSlot >= LENGTH_BASES.length) {
+				throw new MalformedArchiveError(`RAR3 main symbol out of length range: ${symbol}`);
+			}
+			len = LENGTH_BASES[lengthSlot] + 3;
+			if (LENGTH_EXTRA_BITS[lengthSlot] > 0) {
+				len += bits.read(LENGTH_EXTRA_BITS[lengthSlot]);
+			}
+
+			const offsetSymbol = decodeSymbol(offsetHuff, bits);
+			if (offsetSymbol >= OFFSET_BASES.length) {
+				throw new MalformedArchiveError(`RAR3 offset symbol out of range: ${offsetSymbol}`);
+			}
+			offs = OFFSET_BASES[offsetSymbol] + 1;
+			const extraBits = OFFSET_EXTRA_BITS[offsetSymbol];
+			if (extraBits > 0) {
+				if (offsetSymbol > 9) {
+					if (extraBits > 4) {
+						offs += bits.read(extraBits - 4) << 4;
+					}
+					if (lowOffsetRepeats > 0) {
+						lowOffsetRepeats--;
+						offs += lastLowOffset;
+					} else {
+						const lowSymbol = decodeSymbol(lowOffsetHuff, bits);
+						if (lowSymbol === 16) {
+							lowOffsetRepeats = 15;
+							offs += lastLowOffset;
+						} else {
+							offs += lowSymbol;
+							lastLowOffset = lowSymbol;
+						}
+					}
+				} else {
+					offs += bits.read(extraBits);
+				}
+			}
+
+			// libarchive: long-distance matches encode shorter length codes,
+			// so bump the decoded length back up for the appropriate slots.
+			if (offs >= 0x40000) {
+				len++;
+			}
+			if (offs >= 0x2000) {
+				len++;
+			}
+
+			oldOff3 = oldOff2;
+			oldOff2 = oldOff1;
+			oldOff1 = oldOff0;
+			oldOff0 = offs;
+		}
+
+		lastOffset = offs;
+		lastLength = len;
+
+		// inline match copy: when source and destination ranges don't overlap
+		// (distance >= length) and neither end wraps the window, hand it to
+		// `copyWithin` (a single native memmove). overlap (distance < length)
+		// keeps the runlength repeat byte loop.
+		if (offs >= len) {
+			const dst = write & mask;
+			const src = (write - offs) & mask;
+			if (dst + len <= windowSize && src + len <= windowSize) {
+				window.copyWithin(dst, src, src + len);
+				write += len;
+				continue;
+			}
+		}
+		for (let idx = 0; idx < len; idx++) {
+			window[(write + idx) & mask] = window[(write + idx - offs) & mask];
+		}
+		write += len;
+	}
+
+	state.write = write;
+	state.lastOffset = lastOffset;
+	state.lastLength = lastLength;
+	state.lastLowOffset = lastLowOffset;
+	state.lowOffsetRepeats = lowOffsetRepeats;
+	state.oldOff0 = oldOff0;
+	state.oldOff1 = oldOff1;
+	state.oldOff2 = oldOff2;
+	state.oldOff3 = oldOff3;
+	return stop;
+};
+
+// #endregion
+
 // #region decoder
 
 /**
@@ -1092,12 +1335,24 @@ export class Rar3Decoder {
 	#window: Uint8Array = new Uint8Array(0);
 	#windowMask = 0;
 
-	/** four-deep LRU of recent match distances, oldest at index 3. */
-	#oldOffsets: [number, number, number, number] = [0, 0, 0, 0];
-	#lastOffset = 0;
-	#lastLength = 0;
-	#lastLowOffset = 0;
-	#lowOffsetRepeats = 0;
+	/**
+	 * per-symbol LZSS scalars (write pointer mirror, four-deep recent-distance
+	 * LRU, last match length, low-offset run state). held in one object so
+	 * {@link runLzssBlock} can lift them into locals in a single hand-off
+	 * instead of a private-slot load per field.
+	 */
+	readonly #lzss: LzssState = {
+		endNewTable: false,
+		lastLength: 0,
+		lastLowOffset: 0,
+		lastOffset: 0,
+		lowOffsetRepeats: 0,
+		oldOff0: 0,
+		oldOff1: 0,
+		oldOff2: 0,
+		oldOff3: 0,
+		write: 0,
+	};
 
 	/** monotonic count of bytes ever written to the window. */
 	#write = 0;
@@ -1188,11 +1443,14 @@ export class Rar3Decoder {
 	 * reference positions in `[0, write)`, so stale bytes are unreachable).
 	 */
 	reset(): void {
-		this.#oldOffsets = [0, 0, 0, 0];
-		this.#lastOffset = 0;
-		this.#lastLength = 0;
-		this.#lastLowOffset = 0;
-		this.#lowOffsetRepeats = 0;
+		this.#lzss.lastOffset = 0;
+		this.#lzss.lastLength = 0;
+		this.#lzss.lastLowOffset = 0;
+		this.#lzss.lowOffsetRepeats = 0;
+		this.#lzss.oldOff0 = 0;
+		this.#lzss.oldOff1 = 0;
+		this.#lzss.oldOff2 = 0;
+		this.#lzss.oldOff3 = 0;
 		this.#write = 0;
 		this.#lengthTable.fill(0);
 		this.#tables = undefined;
@@ -1632,78 +1890,41 @@ export class Rar3Decoder {
 				continue;
 			}
 
-			const tables = this.#tables!;
-			const mainTable = tables.main;
-			const lengthHuff = tables.length;
-			const offsetHuff = tables.offset;
-			const lowOffsetHuff = tables.lowOffset;
-
-			// sync inner loop. exits when:
-			// - bits margin drops below 16 (refill)
-			// - flush threshold reached
-			// - symbol 256 (end-of-entry; possibly with in-stream table refresh)
-			// - symbol 257 (async filter command)
-			// - write overruns targetWrite (malformed archive)
-			//
-			// `peek16` looks 3 bytes ahead, every read inside is bounded by 16
-			// bits, and the worst-case composite read (length symbol + extras +
-			// offset symbol + extras + low-offset symbol) tops out at well under
-			// 16 bytes — the same cushion the original loop maintained via
-			// `await ensureBytes(16)`.
-			//
-			// the per-symbol mutable state — the window write pointer, the
-			// recent-distance LRU, and the last-low-offset run state — is
-			// pulled into local scalars so the hot literal/match paths skip
-			// the private-slot dispatch every iteration. all locals are
-			// spilled back to `this.#…` before each `break syncDecode`.
-			let write = this.#write;
-			let lastOffset = this.#lastOffset;
-			let lastLength = this.#lastLength;
-			let lastLowOffset = this.#lastLowOffset;
-			let lowOffsetRepeats = this.#lowOffsetRepeats;
-			let oldOff0 = this.#oldOffsets[0];
-			let oldOff1 = this.#oldOffsets[1];
-			let oldOff2 = this.#oldOffsets[2];
-			let oldOff3 = this.#oldOffsets[3];
-
 			// fold the slab cushion + tail-mode branch into one upper bound on
 			// `bits.addr`. `data` doesn't change inside the sync inner (only
 			// the outer's refill rebinds it), so the limit is loop-invariant.
 			const addrLimit = inputExhausted ? bits!.data.length - 5 : bits!.data.length - PAD - 16;
 
-			syncDecode: for (;;) {
-				if (write > targetWrite) {
-					this.#write = write;
-					throw new ChecksumMismatchError(`RAR3 wrote past expected size: ${unpackedSize} bytes`);
-				}
-				if (write - emitted >= FLUSH_HIGH_WATER) {
-					break syncDecode;
-				}
-				if (bits!.addr > addrLimit) {
-					break syncDecode;
-				}
+			// hand off to the extracted synchronous symbol loop. `#write` is the
+			// field the flush/filter/PPMd machinery reads, so mirror it into the
+			// LZSS state around the call. the recent-distance LRU and run state
+			// live in `#lzss` across calls (carrying through a solid run).
+			this.#lzss.write = this.#write;
+			const stop = runLzssBlock(
+				bits!,
+				this.#tables!,
+				window,
+				mask,
+				windowSize,
+				this.#lzss,
+				emitted,
+				targetWrite,
+				FLUSH_HIGH_WATER,
+				addrLimit,
+			);
+			this.#write = this.#lzss.write;
 
-				const symbol = decodeSymbol(mainTable, bits!);
-
-				if (symbol < 256) {
-					window[write++ & mask] = symbol;
-					continue;
+			switch (stop) {
+				case LZSS_END: {
+					// end-of-entry marker: `endNewTable` decided whether the next
+					// entry rebuilds Huffman tables or carries the current set over.
+					this.#startNewTable = this.#lzss.endNewTable;
+					endMarkerSeen = true;
+					break;
 				}
-
-				if (symbol === 256) {
-					const newFile = bits!.read(1) === 0;
-					if (newFile) {
-						// end-of-entry marker: the next bit decides whether the next
-						// entry rebuilds Huffman tables or carries the current set
-						// over (solid runs typically carry).
-						this.#startNewTable = bits!.read(1) !== 0;
-						endMarkerSeen = true;
-						break syncDecode;
-					}
+				case LZSS_REFRESH: {
 					// in-stream table change: re-parse codes against the same length
-					// table and keep decoding from the new tables. break out of the
-					// inner loop so the outer can refresh the table-local references.
-					this.#write = write;
+					// table and keep decoding from the new tables next iteration.
 					const refreshed = parseCodes(bits!, this.#lengthTable, this.#codePool);
 					if (refreshed.kind !== 'huffman') {
 						throw new MalformedArchiveError(
@@ -1711,152 +1932,17 @@ export class Rar3Decoder {
 						);
 					}
 					this.#tables = refreshed.tables;
-					break syncDecode;
+					break;
 				}
-
-				if (symbol === 257) {
+				case LZSS_FILTER: {
 					// filter command bodies can span ~65 KiB and need their own
 					// ensureBytes refills; defer to the async outer.
 					pendingFilter = true;
-					break syncDecode;
+					break;
 				}
-
-				let offs: number;
-				let len: number;
-
-				if (symbol === 258) {
-					if (lastLength === 0) {
-						continue;
-					}
-					offs = lastOffset;
-					len = lastLength;
-				} else if (symbol < 263) {
-					const offsetIndex = symbol - 259;
-					if (offsetIndex === 0) {
-						offs = oldOff0;
-					} else if (offsetIndex === 1) {
-						offs = oldOff1;
-						oldOff1 = oldOff0;
-					} else if (offsetIndex === 2) {
-						offs = oldOff2;
-						oldOff2 = oldOff1;
-						oldOff1 = oldOff0;
-					} else {
-						offs = oldOff3;
-						oldOff3 = oldOff2;
-						oldOff2 = oldOff1;
-						oldOff1 = oldOff0;
-					}
-					oldOff0 = offs;
-					const lengthSymbol = decodeSymbol(lengthHuff, bits!);
-					if (lengthSymbol >= LENGTH_BASES.length) {
-						throw new MalformedArchiveError(`RAR3 length symbol out of range: ${lengthSymbol}`);
-					}
-					len = LENGTH_BASES[lengthSymbol] + 2;
-					if (LENGTH_EXTRA_BITS[lengthSymbol] > 0) {
-						len += bits!.read(LENGTH_EXTRA_BITS[lengthSymbol]);
-					}
-				} else if (symbol < 271) {
-					const slot = symbol - 263;
-					offs = SHORT_BASES[slot] + 1;
-					if (SHORT_EXTRA_BITS[slot] > 0) {
-						offs += bits!.read(SHORT_EXTRA_BITS[slot]);
-					}
-					len = 2;
-					oldOff3 = oldOff2;
-					oldOff2 = oldOff1;
-					oldOff1 = oldOff0;
-					oldOff0 = offs;
-				} else {
-					const lengthSlot = symbol - 271;
-					if (lengthSlot >= LENGTH_BASES.length) {
-						throw new MalformedArchiveError(`RAR3 main symbol out of length range: ${symbol}`);
-					}
-					len = LENGTH_BASES[lengthSlot] + 3;
-					if (LENGTH_EXTRA_BITS[lengthSlot] > 0) {
-						len += bits!.read(LENGTH_EXTRA_BITS[lengthSlot]);
-					}
-
-					const offsetSymbol = decodeSymbol(offsetHuff, bits!);
-					if (offsetSymbol >= OFFSET_BASES.length) {
-						throw new MalformedArchiveError(`RAR3 offset symbol out of range: ${offsetSymbol}`);
-					}
-					offs = OFFSET_BASES[offsetSymbol] + 1;
-					const extraBits = OFFSET_EXTRA_BITS[offsetSymbol];
-					if (extraBits > 0) {
-						if (offsetSymbol > 9) {
-							if (extraBits > 4) {
-								offs += bits!.read(extraBits - 4) << 4;
-							}
-							if (lowOffsetRepeats > 0) {
-								lowOffsetRepeats--;
-								offs += lastLowOffset;
-							} else {
-								const lowSymbol = decodeSymbol(lowOffsetHuff, bits!);
-								if (lowSymbol === 16) {
-									lowOffsetRepeats = 15;
-									offs += lastLowOffset;
-								} else {
-									offs += lowSymbol;
-									lastLowOffset = lowSymbol;
-								}
-							}
-						} else {
-							offs += bits!.read(extraBits);
-						}
-					}
-
-					// libarchive: long-distance matches encode shorter length codes,
-					// so bump the decoded length back up for the appropriate slots.
-					if (offs >= 0x40000) {
-						len++;
-					}
-					if (offs >= 0x2000) {
-						len++;
-					}
-
-					oldOff3 = oldOff2;
-					oldOff2 = oldOff1;
-					oldOff1 = oldOff0;
-					oldOff0 = offs;
-				}
-
-				lastOffset = offs;
-				lastLength = len;
-
-				// inline match copy: when source and destination ranges don't
-				// overlap (distance >= length) and neither end wraps the window,
-				// hand it to `copyWithin` (a single native memmove). overlap
-				// (distance < length) keeps the runlength repeat byte loop.
-				if (offs >= len) {
-					const dst = write & mask;
-					const src = (write - offs) & mask;
-					if (dst + len <= windowSize && src + len <= windowSize) {
-						window.copyWithin(dst, src, src + len);
-						write += len;
-						continue;
-					}
-				}
-				for (let idx = 0; idx < len; idx++) {
-					window[(write + idx) & mask] = window[(write + idx - offs) & mask];
-				}
-				write += len;
+					// LZSS_FLUSH / LZSS_REFILL: the outer loop's flush gate and refill
+					// step handle these on the next iteration.
 			}
-
-			// spill the per-symbol locals back to the decoder's fields so the
-			// outer flush/refill/filter machinery (and any subsequent decode()
-			// call in the same solid run) sees consistent state. the literal
-			// path's overshoot check inside the loop already spills `write`
-			// before throwing.
-			this.#write = write;
-			this.#lastOffset = lastOffset;
-			this.#lastLength = lastLength;
-			this.#lastLowOffset = lastLowOffset;
-			this.#lowOffsetRepeats = lowOffsetRepeats;
-			this.#oldOffsets[0] = oldOff0;
-			this.#oldOffsets[1] = oldOff1;
-			this.#oldOffsets[2] = oldOff2;
-			this.#oldOffsets[3] = oldOff3;
 		}
 
 		await flush(true);
