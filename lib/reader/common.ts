@@ -58,7 +58,42 @@ export function fromFile(blob: Blob): Reader {
 			const endOffset = length !== undefined ? offset + length : totalLength;
 
 			const slice = blob.slice(offset, endOffset);
-			return slice.stream();
+			const expected = slice.size;
+
+			// Bun's Blob-backed slice streams can fail to emit a final
+			// `{ done: true }` (empty slices never close; others stall a
+			// read-until-close consumer), so re-emit the bytes through a stream
+			// we close ourselves once the slice length has been delivered,
+			// without issuing the trailing read that would block.
+			const source = slice.stream().getReader();
+			let delivered = 0;
+
+			return new ReadableStream<Uint8Array<ArrayBuffer>>({
+				type: 'bytes',
+				async pull(rawController) {
+					const controller = rawController as ReadableByteStreamController;
+
+					if (delivered >= expected) {
+						controller.close();
+						source.cancel().catch(() => {});
+						return;
+					}
+
+					const { done, value } = await source.read();
+					if (done) {
+						controller.close();
+						return;
+					}
+
+					if (value.byteLength > 0) {
+						delivered += value.byteLength;
+						controller.enqueue(value as Uint8Array<ArrayBuffer>);
+					}
+				},
+				cancel(reason) {
+					return source.cancel(reason);
+				},
+			}, { highWaterMark: 64 * 1024 });
 		},
 	};
 }
