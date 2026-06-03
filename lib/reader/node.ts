@@ -35,7 +35,9 @@ export const fromFileHandle = async (handle: FileHandle): Promise<Reader> => {
 					// allocation + queue copy that the default-reader path
 					// pays on every chunk.
 					const byob = controller.byobRequest;
-					if (byob !== null) {
+					// loose `!= null`: Bun yields `undefined` for an absent
+					// byobRequest, not the spec's `null`.
+					if (byob != null) {
 						const view = byob.view as Uint8Array<ArrayBuffer>;
 						const cap = view.byteLength <= remaining ? view.byteLength : remaining;
 						const target = cap === view.byteLength ? view : new Uint8Array(view.buffer, view.byteOffset, cap);
