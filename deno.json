@@ -1,6 +1,6 @@
 {
 	"name": "@mary/rar",
-	"version": "0.2.1",
+	"version": "0.2.2",
 	"license": "0BSD",
 	"exports": {
 		".": "./lib/mod.ts",
