@@ -26,7 +26,7 @@ import type { FileBlock, Rar3Block } from './block.ts';
 import { parseBlock } from './block.ts';
 import { CompressMethod, FileFlag, MainFlag, RAR3_SIGNATURE } from './constants.ts';
 import { decryptRar3HeadersIfNeeded, decryptRar3Stream } from './crypto.ts';
-import { Rar3Decoder } from './unpack.ts';
+import { Rar3Decoder, type DecodeSink } from './unpack.ts';
 
 /**
  * @module
@@ -148,6 +148,8 @@ export class Rar3Entry {
 	readonly #password?: string;
 
 	#chunks?: Promise<Uint8Array<ArrayBuffer>[]>;
+	#streamStart?: () => void;
+	#streamBody?: ReadableStream<Uint8Array>;
 
 	/** @ignore */
 	constructor(
@@ -254,7 +256,7 @@ export class Rar3Entry {
 		return this.#chunks;
 	}
 
-	async #decode(): Promise<Uint8Array<ArrayBuffer>[]> {
+	async #decode(sink?: DecodeSink): Promise<Uint8Array<ArrayBuffer>[]> {
 		if (this.isEncrypted && (this.#password === undefined || this.#head.salt === undefined)) {
 			throw new MissingPasswordError(
 				`encrypted RAR3 entry: password required` +
@@ -308,8 +310,11 @@ export class Rar3Entry {
 		// its own first symbol.
 		const chunks: Uint8Array<ArrayBuffer>[] = [];
 		await using reader = new StreamReader(source);
-		await this.#decoder.decode(reader, expected, (chunk) => {
+		await this.#decoder.decode(reader, expected, async (chunk) => {
 			chunks.push(chunk);
+			if (sink !== undefined) {
+				await sink(chunk);
+			}
 		});
 		this.#verifyCrc32(chunks);
 		return chunks;
@@ -353,6 +358,55 @@ export class Rar3Entry {
 				streamSegments(this.#segments),
 				crc32Verifier(this.filename, this.#head.unpackedSize, this.#finalCrc),
 			);
+		}
+
+		if (this.#chunks === undefined && this.#streamBody === undefined) {
+			const transform = new TransformStream<Uint8Array, Uint8Array>();
+			const writer = transform.writable.getWriter();
+			let started = false;
+			let disconnected = false;
+
+			this.#streamStart = () => {
+				if (started) return;
+				started = true;
+				this.#chunks = this.#decode(async (chunk) => {
+					if (disconnected) return;
+					try {
+						await writer.ready;
+						await writer.write(chunk);
+					} catch {
+						// The consumer canceled the readable side. Keep decoding so
+						// the entry still reaches CRC verification and the cache is
+						// complete for later consumers / solid-run draining.
+						disconnected = true;
+					}
+				});
+
+				this.#chunks = this.#chunks.then(async (chunks) => {
+					if (!disconnected) {
+						try {
+							await writer.ready;
+							await writer.close();
+						} catch {
+							disconnected = true;
+						}
+					}
+					return chunks;
+				}, async (error) => {
+					if (!disconnected) {
+						try {
+							await writer.abort(error);
+						} catch {}
+					}
+					throw error;
+				});
+			};
+
+			this.#streamBody = deferStream(async () => {
+				this.#streamStart!();
+				return transform.readable;
+			});
+			return this.#streamBody;
 		}
 
 		return deferStream(async () => {
